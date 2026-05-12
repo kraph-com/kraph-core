@@ -492,25 +492,56 @@ async fn extend_handler(
 // Idle-suspend lifecycle handlers
 // ---------------------------------------------------------------------------
 //
-// /touch: cheap bump of last_seen_at. The gateway's subdomain proxy hits
-// this on every forwarded request so the idle tracker has fresh state.
-// Sigauth uses the instance's bound wallet — but during the rollout
-// we'd rather have updates land than have the proxy fall back to "not
-// signed → request blocked". So missing-sig is treated as a warning and
-// the bump still applies (the worst case is a third party can prevent
-// idle-suspend of someone else's instance, which is a free-RAM nuisance
-// not a security hole).
+// All three endpoints (/touch, /resume, /pin) are gateway-only. Agents
+// never reach node-rs directly — traffic flows kraph.com → gateway →
+// node-rs. So the trust anchor is the operator pubkey, not the agent's
+// wallet, consistent with the audit-2026-05-11 hardening (sigauth
+// required, no soft-accept) and side-stepping the "Privy denies
+// signMessage" problem that prevents the gateway from signing as an
+// OAuth-authed agent.
 //
-// /resume: cold-start the compose stack. Serialized by resume_locks per
-// instance id so concurrent first-hit requests share a single compose
-// start. Sigauth optional same as /touch — gateway signs when it can.
-//
-// /pin: gateway-only. Operator-pubkey sigauth so a hostile agent can't
-// freely extend pinned_until without paying for it.
+// /touch: cheap bump of last_seen_at on every forwarded proxy request.
+// /resume: cold-start a suspended stack, coalesced per instance via
+//   AppState::resume_locks.
+// /pin: extend instances.pinned_until after a successful x402
+//   settlement on kraph_pin_instance.
 
+/// Body shared by `/touch` and `/resume`. The `operator` field's
+/// pubkey must match SUPABA_OPERATOR_ADDRESS on the node, AND the
+/// request must be sigauth-signed by the matching keypair.
 #[derive(Deserialize)]
-struct TouchRequest {
-    wallet: String,
+struct OperatorOnlyRequest {
+    operator: String,
+}
+
+/// Reusable operator-sigauth gate. Returns Err with a ready-to-send
+/// (StatusCode, Json) on any failure; Ok(()) when the request can
+/// proceed. Used by `/touch`, `/resume`, `/pin`.
+fn verify_operator_signed(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    method: &str,
+    path: &str,
+    body_bytes: &axum::body::Bytes,
+    operator: &str,
+) -> std::result::Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Some(expected) = state.config.operator_address.as_deref() {
+        if expected != operator {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "operator pubkey does not match SUPABA_OPERATOR_ADDRESS"
+                })),
+            ));
+        }
+    }
+    if let Err(e) = sigauth::verify_request_sig(headers, method, path, body_bytes, operator) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": format!("operator sigauth: {e}") })),
+        ));
+    }
+    Ok(())
 }
 
 async fn touch_handler(
@@ -519,36 +550,22 @@ async fn touch_handler(
     headers: HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    let req: TouchRequest = serde_json::from_slice(&body_bytes)
+    let req: OperatorOnlyRequest = serde_json::from_slice(&body_bytes)
         .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
 
-    // Verify the caller owns the instance before stamping. We don't
-    // hard-fail on missing sigs (rollout phase) but we DO verify
-    // wallet→instance binding regardless.
-    let instance = state
-        .db
-        .get_instance(&id, &req.wallet)?
-        .ok_or_else(|| AppError(anyhow::anyhow!("instance {id} not found for wallet")))?;
-    drop(instance);
-
-    if let Err(e) = sigauth::verify_request_sig(
+    if let Err((code, body)) = verify_operator_signed(
+        &state,
         &headers,
         "POST",
         &format!("/instances/{id}/touch"),
         &body_bytes,
-        &req.wallet,
+        &req.operator,
     ) {
-        // Soft-fail during rollout — the bump is low-risk.
-        tracing::debug!(id, error = %e, "/touch sigauth missing/invalid (soft-accept)");
+        return Ok((code, body).into_response());
     }
 
     state.db.touch_instance(&id)?;
     Ok(Json(serde_json::json!({ "status": "touched", "id": id })).into_response())
-}
-
-#[derive(Deserialize)]
-struct ResumeRequest {
-    wallet: String,
 }
 
 async fn resume_handler(
@@ -557,23 +574,24 @@ async fn resume_handler(
     headers: HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Result<impl IntoResponse, AppError> {
-    let req: ResumeRequest = serde_json::from_slice(&body_bytes)
+    let req: OperatorOnlyRequest = serde_json::from_slice(&body_bytes)
         .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
 
-    let instance = state
-        .db
-        .get_instance(&id, &req.wallet)?
-        .ok_or_else(|| AppError(anyhow::anyhow!("instance {id} not found for wallet")))?;
-
-    if let Err(e) = sigauth::verify_request_sig(
+    if let Err((code, body)) = verify_operator_signed(
+        &state,
         &headers,
         "POST",
         &format!("/instances/{id}/resume"),
         &body_bytes,
-        &req.wallet,
+        &req.operator,
     ) {
-        tracing::debug!(id, error = %e, "/resume sigauth missing/invalid (soft-accept)");
+        return Ok((code, body).into_response());
     }
+
+    let instance = state
+        .db
+        .get_instance_by_id(&id)?
+        .ok_or_else(|| AppError(anyhow::anyhow!("instance {id} not found")))?;
 
     // Fast-path: already running. Skip the lock + bump last_seen.
     if instance.lifecycle_state == "running" {
@@ -621,9 +639,7 @@ async fn resume_handler(
 
 #[derive(Deserialize)]
 struct PinRequest {
-    /// Gateway's operator pubkey — used for sigauth verification (the
-    /// gateway is the only party allowed to call /pin since it's the
-    /// gatekeeper of the x402 settlement that funds the pin).
+    /// Gateway's operator pubkey — same gate as `/touch` and `/resume`.
     operator: String,
     /// Unix epoch seconds the pin should run through. Idempotent against
     /// the current value: server takes max(existing, until_ts).
@@ -639,36 +655,15 @@ async fn pin_handler(
     let req: PinRequest = serde_json::from_slice(&body_bytes)
         .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
 
-    // /pin MUST be hard-gated. A free /pin endpoint = free RAM reservation
-    // for anyone, breaking the entire monetization. The gateway signs
-    // with its operator keypair after a successful x402 settlement;
-    // hostile callers without that key are rejected.
-    if let Err(e) = sigauth::verify_request_sig(
+    if let Err((code, body)) = verify_operator_signed(
+        &state,
         &headers,
         "POST",
         &format!("/instances/{id}/pin"),
         &body_bytes,
         &req.operator,
     ) {
-        return Ok((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": format!("/pin sigauth: {e}") })),
-        )
-            .into_response());
-    }
-
-    // The signing pubkey must match the SUPABA_OPERATOR_ADDRESS configured
-    // on this node — checks at startup. Re-checking here costs nothing.
-    if let Some(expected) = state.config.operator_address.as_deref() {
-        if expected != req.operator {
-            return Ok((
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "operator pubkey does not match SUPABA_OPERATOR_ADDRESS"
-                })),
-            )
-                .into_response());
-        }
+        return Ok((code, body).into_response());
     }
 
     let resolved = state.db.set_pinned_until(&id, req.until_ts)?;
