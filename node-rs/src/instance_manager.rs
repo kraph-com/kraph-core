@@ -17,6 +17,20 @@ use crate::config::Config;
 use crate::db::{Database, Instance};
 use crate::warm_pool::{self, WarmInstance};
 
+/// 36-char alphabet for instance IDs. Lowercase letters + digits only.
+/// Two constraints must hold simultaneously:
+///   1. Docker compose project names must be lowercase.
+///   2. DNS subdomains (RFC 1123) cannot contain underscores, and must
+///      not start or end with a hyphen.
+/// The default `nanoid` alphabet (`_-0-9A-Za-z`) violates both, so we
+/// hand-pick this 36-char set. With length 12 that's >62 bits of
+/// entropy — collision probability for ~10k instances is ~1e-11.
+const DNS_SAFE_ID_ALPHABET: [char; 36] = [
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n',
+    'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1',
+    '2', '3', '4', '5', '6', '7', '8', '9',
+];
+
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
@@ -214,8 +228,17 @@ impl InstanceManager {
             );
         }
 
-        // 2. Instance ID (lowercase only — Docker compose project names must be lowercase).
-        let id = nanoid::nanoid!(12).to_lowercase();
+        // 2. Instance ID. Must satisfy both Docker (lowercase) AND DNS
+        // (RFC 1123 hostnames — no underscores, no leading/trailing
+        // dashes) because the gateway exposes each instance as a
+        // subdomain `<id>.kraph.com`. The default nanoid alphabet
+        // includes `_`, which is a DNS-INVALID character: any ID with
+        // an underscore made the public URL unresolvable and every
+        // kraph_query / kraph_invoke_function against that instance
+        // failed with ECONNREFUSED. Constrain to lowercase letters +
+        // digits (36 chars) to dodge both DNS and lowercasing concerns
+        // in one shot.
+        let id = nanoid::nanoid!(12, &DNS_SAFE_ID_ALPHABET);
         let compose_project = format!("supaba-{id}");
         info!(id = %id, wallet = %request.wallet_pubkey, "preparing new instance metadata");
 
@@ -436,8 +459,10 @@ impl InstanceManager {
             );
         }
 
-        // 2. Instance ID and compose project name.
-        let id = nanoid::nanoid!(12);
+        // 2. Instance ID and compose project name. Same DNS-safe
+        // alphabet as the cold path above — underscores from the
+        // default nanoid alphabet make `<id>.kraph.com` unresolvable.
+        let id = nanoid::nanoid!(12, &DNS_SAFE_ID_ALPHABET);
         let compose_project = format!("supaba-{id}");
         info!(id = %id, wallet = %request.wallet_pubkey, "provisioning from warm instance");
 
