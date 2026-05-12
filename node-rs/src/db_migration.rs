@@ -32,6 +32,20 @@ use tracing::{info, warn};
 
 const MAX_LOG_BYTES: usize = 64 * 1024;
 const DEFAULT_TIMEOUT_SECS: u64 = 30 * 60; // 30 min
+/// Audit F66: server-clamped maximum wall-clock timeout. Even though
+/// the gateway's tool parameter advertises a sane default, an attacker
+/// who reaches the node directly (or a tampered gateway) could pass an
+/// arbitrarily large `timeoutSecs` and tie up Docker capacity. 2 hours
+/// is generous for a real production migration and refuses anything
+/// larger.
+const MAX_TIMEOUT_SECS: u64 = 2 * 60 * 60;
+
+/// Clamp a caller-supplied timeout to MAX_TIMEOUT_SECS. None → default.
+pub(crate) fn clamp_timeout_secs(supplied: Option<u64>) -> u64 {
+    supplied
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+        .min(MAX_TIMEOUT_SECS)
+}
 
 #[derive(Debug, Deserialize)]
 pub struct MigrationStartRequest {
@@ -299,7 +313,7 @@ echo "::kraph-migrate-result:: dump=$DUMP_RC restore=$RESTORE_RC"
         })
     };
 
-    let timeout = req.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let timeout = clamp_timeout_secs(req.timeout_secs);
     let exit_code = {
         let wait_fut = async {
             let mut s = docker.wait_container(
@@ -546,7 +560,7 @@ echo "::kraph-migrate-result:: dump=$DUMP_RC restore=$RESTORE_RC pub=$PUB_RC sub
         .await
         .context("start live_sync container")?;
     let logs_handle = drain_logs(docker.clone(), cid.clone());
-    let timeout = req.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let timeout = clamp_timeout_secs(req.timeout_secs);
     let exit_code = match tokio::time::timeout(
         tokio::time::Duration::from_secs(timeout),
         async {

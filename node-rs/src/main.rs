@@ -5,6 +5,8 @@ mod frontend_build;
 mod health;
 mod instance_manager;
 mod integrity;
+mod job_admission;
+mod path_safety;
 mod replication;
 mod sigauth;
 mod studio_proxy;
@@ -220,6 +222,19 @@ async fn provision_handler(
         )
             .into_response());
     }
+    // Audit F69: replica endpoints arrive in the SAME signed body so we
+    // can register them now without an unsigned follow-up. Snapshot the
+    // list before `req` is moved into the manager.
+    let replica_endpoints: Vec<String> = req
+        .replica_endpoints
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.trim().trim_end_matches('/').to_string())
+        .filter(|e| {
+            !e.is_empty() && (e.starts_with("http://") || e.starts_with("https://"))
+        })
+        .collect();
     // Try the warm pool first if anything is in it. provision_from_warm is
     // also async-friendly because it does down+up in <2s when the warm
     // instance is healthy.
@@ -257,6 +272,31 @@ async fn provision_handler(
         // running/degraded transition.
         state.manager.prepare_provision(req).await?
     };
+
+    // Audit F69: register the signed replica endpoints now, in the same
+    // logical operation as provision. No unsigned follow-up call needed
+    // — strict sigauth on /instances/:id/replicas can't break the
+    // provision flow because the gateway no longer needs to call it.
+    for ep in &replica_endpoints {
+        match state.db.add_instance_replica(&result.id, ep) {
+            Ok(added) => {
+                info!(
+                    instance_id = %result.id,
+                    endpoint = %ep,
+                    added,
+                    "replica registered from signed provision body"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    instance_id = %result.id,
+                    endpoint = %ep,
+                    error = %e,
+                    "replica registration failed (continuing)"
+                );
+            }
+        }
+    }
 
     // If the result came back as 'provisioning' it means we took the cold
     // path (or warm fast path is somehow still in flight). Spawn the docker
@@ -523,16 +563,98 @@ fn sanitise_path(s: &str) -> String {
         .join("/")
 }
 
+/// Per-wallet daily byte quota for /ipfs/pin (audit F65). Default 100 MiB
+/// per day. Operators can override via `SUPABA_IPFS_DAILY_BYTES_PER_WALLET`.
+/// State is in-memory: (wallet, utc_day_bucket) → bytes_pinned_today. Day
+/// rolls over implicitly because (wallet, new_day) is a fresh key; old
+/// buckets are pruned opportunistically on every call.
+fn ipfs_daily_quota_bytes() -> u64 {
+    std::env::var("SUPABA_IPFS_DAILY_BYTES_PER_WALLET")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(100 * 1024 * 1024)
+}
+
+fn ipfs_quota_state() -> &'static std::sync::Mutex<std::collections::HashMap<(String, i64), u64>>
+{
+    static STATE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(String, i64), u64>>,
+    > = std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Returns Ok(()) if the wallet is under quota after adding `add_bytes`,
+/// or Err(remaining_bytes_today) describing how much was left at refusal.
+fn ipfs_check_and_charge(wallet: &str, add_bytes: u64) -> Result<(), u64> {
+    let cap = ipfs_daily_quota_bytes();
+    let today = chrono::Utc::now().timestamp() / 86_400;
+    let mut map = ipfs_quota_state()
+        .lock()
+        .expect("ipfs quota mutex poisoned");
+    // Opportunistic prune of stale buckets to bound memory growth.
+    map.retain(|(_, day), _| *day >= today - 1);
+    let entry = map.entry((wallet.to_string(), today)).or_insert(0);
+    let next = entry.saturating_add(add_bytes);
+    if next > cap {
+        let remaining = cap.saturating_sub(*entry);
+        return Err(remaining);
+    }
+    *entry = next;
+    Ok(())
+}
+
 async fn ipfs_pin_handler(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<IpfsPinRequest>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
 ) -> Result<impl IntoResponse, AppError> {
+    // Audit F65: parse the body manually so we can hand it to sigauth.
+    // The pre-rewrite handler trusted walletPubkey from the request body,
+    // which made /ipfs/pin a free-for-all for anyone who could reach the
+    // node directly. Now wallet identity is bound by ed25519 signature
+    // and pin bytes are rate-limited per wallet per day.
+    let req: IpfsPinRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
+    if req.wallet_pubkey.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "walletPubkey is required" })),
+        ));
+    }
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        "/ipfs/pin",
+        &body_bytes,
+        &req.wallet_pubkey,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ));
+    }
+
     let multi_mode = matches!(&req.files, Some(f) if !f.is_empty());
     if !multi_mode && req.content.as_deref().unwrap_or("").is_empty() {
         return Ok((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "either `content` (single-file) or `files` (multi-file SPA) is required",
+            })),
+        ));
+    }
+
+    // Audit F65: per-wallet daily byte quota. body length is a safe
+    // upper bound on the bytes Kubo will accept (multipart adds a few
+    // hundred bytes of framing, never less than the raw content).
+    let pin_bytes = body_bytes.len() as u64;
+    if let Err(remaining) = ipfs_check_and_charge(&req.wallet_pubkey, pin_bytes) {
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "ipfs daily pin quota exceeded",
+                "remaining_bytes_today": remaining,
+                "daily_limit_bytes": ipfs_daily_quota_bytes(),
             })),
         ));
     }
@@ -876,6 +998,26 @@ async fn build_and_pin_handler(
         }
     };
 
+    // Audit F66: cap concurrent builds at 1 per wallet AND 1 per
+    // instance. Drop on error so the slot is freed before we return.
+    let _admit = match job_admission::try_acquire(
+        job_admission::JobKind::Build,
+        &req.wallet_pubkey,
+        &id,
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "build_already_in_progress",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response());
+        }
+    };
+
     let docker = std::sync::Arc::new(
         bollard::Docker::connect_with_local_defaults()
             .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?,
@@ -1014,6 +1156,27 @@ async fn migrate_start_handler(
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({
                     "error": "instance not found or not owned by this wallet"
+                })),
+            )
+                .into_response());
+        }
+    };
+    // Audit F66: 1 active migration per instance, node-side enforced.
+    // The gateway already debounces this on its own state but a forged
+    // gateway call could fire concurrent pg_restores into the same
+    // instance — partial-state recovery is a nightmare.
+    let _admit = match job_admission::try_acquire(
+        job_admission::JobKind::Migration,
+        &req.wallet_pubkey,
+        &id,
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "migration_already_in_progress",
+                    "message": e.to_string(),
                 })),
             )
                 .into_response());
@@ -1496,33 +1659,61 @@ async fn integrity_root_handler(
         .output()
         .await;
 
-    let root = match out {
+    // Audit F71: previously docker/SQL failure returned sha256("")
+    // — a real-looking 32-byte hash that callers could mistake for a
+    // valid commitment to an empty schema. Now: failure surfaces as a
+    // 502 with valid:false so verify_integrity callers can distinguish
+    // "schema is empty" from "we have no idea what's in this DB."
+    let (root, valid, error_msg) = match out {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() {
+            let h = if s.is_empty() {
                 hex::encode(sha2::Sha256::digest(b""))
             } else {
                 hex::encode(sha2::Sha256::digest(s.as_bytes()))
-            }
+            };
+            (Some(h), true, None)
         }
         Ok(o) => {
-            let stderr_tail = String::from_utf8_lossy(&o.stderr);
+            let stderr_tail = String::from_utf8_lossy(&o.stderr).to_string();
             tracing::error!(
                 instance_id = %id,
                 status = %o.status,
                 stderr = %stderr_tail.chars().take(400).collect::<String>(),
                 "merkle root query failed"
             );
-            hex::encode(sha2::Sha256::digest(b""))
+            (
+                None,
+                false,
+                Some(format!(
+                    "psql exited {}: {}",
+                    o.status,
+                    stderr_tail.chars().take(200).collect::<String>()
+                )),
+            )
         }
         Err(e) => {
             tracing::error!(instance_id = %id, error = %e, "merkle root docker exec failed");
-            hex::encode(sha2::Sha256::digest(b""))
+            (None, false, Some(format!("docker exec failed: {e}")))
         }
     };
 
+    if !valid {
+        return Ok((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "instance_id": id,
+                "valid": false,
+                "error": error_msg.unwrap_or_else(|| "unknown integrity failure".into()),
+                "computed_at": chrono::Utc::now().to_rfc3339(),
+            })),
+        )
+            .into_response());
+    }
+
     Ok(Json(serde_json::json!({
         "instance_id": id,
+        "valid": true,
         "merkle_root": root,
         "computed_at": chrono::Utc::now().to_rfc3339(),
     }))
@@ -1693,10 +1884,40 @@ async fn deploy_function_handler(
 
 async fn list_functions_handler(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Query(q): Query<IntegrityQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let wallet = q.wallet.unwrap_or_default();
+    // Audit F61: empty wallet must NEVER bypass ownership on a public
+    // route. `InstanceManager::get_instance(id, "")` skips ownership
+    // (admin-style lookup intended for internal callers only), so reject
+    // the query before it ever reaches that path.
+    let wallet = match q.wallet.as_deref() {
+        Some(w) if !w.is_empty() => w.to_string(),
+        _ => {
+            return Ok((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "wallet query param required" })),
+            )
+                .into_response());
+        }
+    };
+    // Audit F61: function inventory is sensitive; require sigauth so
+    // X-Wallet-Pubkey cannot be spoofed when the node is reachable
+    // directly.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "GET",
+        &format!("/instances/{id}/functions"),
+        &[],
+        &wallet,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
     let instance = match state.manager.get_instance(&id, &wallet)? {
         Some(i) => i,
         None => {
@@ -1746,10 +1967,38 @@ async fn list_functions_handler(
 /// inside the container; we don't run a build step).
 async fn get_function_source_handler(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Path((id, name)): Path<(String, String)>,
     Query(q): Query<IntegrityQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let wallet = q.wallet.unwrap_or_default();
+    // Audit F61: empty wallet must NEVER bypass ownership on a public
+    // route. Refuse before reaching get_instance's admin path.
+    let wallet = match q.wallet.as_deref() {
+        Some(w) if !w.is_empty() => w.to_string(),
+        _ => {
+            return Ok((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "wallet query param required" })),
+            )
+                .into_response());
+        }
+    };
+    // Audit F61: function source is high-value (business logic, baked
+    // tokens). Require sigauth so direct node access cannot exfiltrate
+    // source by spoofing a wallet identity.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "GET",
+        &format!("/instances/{id}/functions/{name}/source"),
+        &[],
+        &wallet,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
     let instance = match state.manager.get_instance(&id, &wallet)? {
         Some(i) => i,
         None => {
@@ -2040,21 +2289,69 @@ async fn set_env_handler(
 
     // Rewrite .env + recreate the functions container. apply_env_to_functions
     // spawns the docker work itself; the file rewrite is sync.
-    if let Err(e) = state.manager.apply_env_to_functions(&id).await {
-        // Log but don't fail the request — the DB is already updated. The
-        // agent can call /env/apply to retry the file+restart step.
-        warn!(
-            error = %e,
+    //
+    // Audit F70: ONE in-line retry before giving up so a transient
+    // docker hiccup doesn't strand the caller with applied:false (and
+    // the user staring at a UI saying "secret set" while functions
+    // still run the old value). Two attempts max: ~3–5 s per recreate
+    // plus a single 500 ms backoff ≈ 7 s worst case, comfortably under
+    // the gateway-side 10 s timeout on /env. After both attempts:
+    //   * Plain (agent-set) env: ok:true, applied:false, surface the
+    //     warning prominently so the client knows to call /env/apply.
+    //   * Protected (user-paste-in) env: FAIL CLOSED — return 503 with
+    //     applied:false. Protected secrets are typically credentials
+    //     the app needs RIGHT NOW; silently succeeding here lets
+    //     downstream code run against the OLD secret and produces the
+    //     intermittent failures the audit flagged.
+    let mut apply_err: Option<String> = None;
+    for attempt in 0..2 {
+        match state.manager.apply_env_to_functions(&id).await {
+            Ok(()) => {
+                apply_err = None;
+                break;
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                warn!(
+                    error = %msg,
+                    instance_id = %id,
+                    attempt,
+                    "apply_env_to_functions failed; will retry"
+                );
+                apply_err = Some(msg);
+                // Only sleep if another attempt is coming. Single 500 ms
+                // backoff between the two attempts.
+                if attempt == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+    if let Some(err) = apply_err {
+        let status_code = if req.protected {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::OK
+        };
+        error!(
             instance_id = %id,
-            "apply_env_to_functions failed after upsert; DB is authoritative"
+            key = %req.key,
+            protected = req.protected,
+            error = %err,
+            "apply_env_to_functions failed after 2 attempts"
         );
         return (
-            StatusCode::OK,
+            status_code,
             Json(serde_json::json!({
-                "ok": true,
+                "ok": !req.protected,
                 "key": req.key,
                 "applied": false,
-                "warning": format!("persisted but apply failed: {e}"),
+                "error": format!("functions container recreate failed after 2 attempts: {err}"),
+                "hint": if req.protected {
+                    "Protected secrets must reach the functions container before this call returns success. Retry kraph_set_env or call /env/apply once the node recovers."
+                } else {
+                    "DB row is updated but the functions container did NOT pick it up. Call /env/apply (or kraph_set_env again) once node load eases."
+                },
             })),
         )
             .into_response();
@@ -2074,21 +2371,21 @@ async fn set_env_handler(
 
 /// `GET /instances/:id/env` — list env vars.
 ///
-/// Query params:
-///   - `include_protected=true|false` (default `false`): when false, rows
-///     where `protected=true` are returned with `value=null`. The agent's
-///     kraph_list_env path goes through the gateway with the default
-///     (false) so user-paste-in secrets stay opaque to the agent.
-///     The dashboard-api's secrets-listing endpoint passes
-///     `include_protected=true` so the human owner can audit their
-///     own secrets in the Forge UI. Wallet-owner check still applies
-///     either way; this is a defence-in-depth filter, not the only
-///     boundary.
+/// Authority: requires sigauth (audit F60). The X-Wallet-Pubkey header is
+/// only an identity hint; the actual authority is the per-call ed25519
+/// signature from that wallet. Without sigauth, anyone who can reach this
+/// route directly could spoof X-Wallet-Pubkey and read another wallet's
+/// env values.
+///
+/// Protected rows ALWAYS come back with `value=null` from this public
+/// route. The `include_protected=true` plaintext path was removed (audit
+/// F60). Operator/dashboard tooling that needs protected plaintext must
+/// use a separate internal credential path, not this public route.
 async fn list_env_handler(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
-    Query(q): Query<std::collections::HashMap<String, String>>,
+    Query(_q): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let wallet = match extract_wallet_header(&headers) {
         Ok(w) => w,
@@ -2098,17 +2395,28 @@ async fn list_env_handler(
         return e.into_response();
     }
 
-    let include_protected = q
-        .get("include_protected")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+    // Audit F60: require per-call signature on env reads. GET has no body
+    // so sign against sha256("").
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "GET",
+        &format!("/instances/{id}/env"),
+        &[],
+        &wallet,
+    ) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
 
     match state.db.list_env_full_with_protection(&id) {
         Ok(rows) => {
             let env: Vec<_> = rows
                 .into_iter()
                 .map(|(k, v, prot, ts)| {
-                    if prot && !include_protected {
+                    if prot {
                         // Hide the value; surface that it exists and is
                         // protected so the agent can REFERENCE the key
                         // by name in code without ever seeing plaintext.
@@ -2142,6 +2450,10 @@ async fn list_env_handler(
 }
 
 /// `GET /instances/:id/env/keys` — list just the env-var keys.
+///
+/// Audit F60: requires sigauth. Key enumeration is sensitive (it exposes
+/// which secrets exist) so the X-Wallet-Pubkey header alone is not enough
+/// authority — the caller must produce a per-call signature.
 async fn list_env_keys_handler(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -2153,6 +2465,20 @@ async fn list_env_keys_handler(
     };
     if let Err(e) = require_owned_instance(&state, &id, &wallet) {
         return e.into_response();
+    }
+
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "GET",
+        &format!("/instances/{id}/env/keys"),
+        &[],
+        &wallet,
+    ) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
     }
 
     match state.db.get_env_keys(&id) {
@@ -2265,6 +2591,9 @@ async fn delete_env_handler(
 /// `POST /instances/:id/env/apply` — force a rewrite of the functions
 /// `.env` file and recreate the functions container. Useful after an
 /// out-of-band DB edit or to retry a failed apply.
+///
+/// Audit F60: requires sigauth — apply triggers a container recreate
+/// (mild DoS surface) so X-Wallet-Pubkey header alone is not authority.
 async fn apply_env_handler(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -2276,6 +2605,20 @@ async fn apply_env_handler(
     };
     if let Err(e) = require_owned_instance(&state, &id, &wallet) {
         return e.into_response();
+    }
+
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{id}/env/apply"),
+        &[],
+        &wallet,
+    ) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
     }
 
     match state.manager.apply_env_to_functions(&id).await {

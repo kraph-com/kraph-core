@@ -45,6 +45,17 @@ use walkdir::WalkDir;
 
 /// Maximum captured build log size returned in the response (bytes).
 const MAX_LOG_BYTES: usize = 256 * 1024;
+/// Audit F66: hard cap on the total bytes a build output can take up
+/// before pinning. Without this, an attacker-controlled build script
+/// could `dd if=/dev/urandom of=output/blob bs=1M count=1G` and burn
+/// gigabytes of memory + Kubo disk. 100 MB matches the audit's
+/// recommended quota table.
+const MAX_PIN_OUTPUT_BYTES: u64 = 100 * 1024 * 1024;
+/// Audit F66: hard cap on the file count. 5,000 is way more than any
+/// real frontend (a Next.js SPA with sourcemaps is typically <500
+/// files) and short-circuits zip-bomb-style outputs before we read
+/// them all into memory.
+const MAX_PIN_OUTPUT_FILES: usize = 5_000;
 /// Hard wall-clock cap on a single build, including npm install + build.
 const BUILD_TIMEOUT_SECS: u64 = 600;
 
@@ -496,12 +507,33 @@ async fn pin_directory_to_kubo(kubo_api_url: &str, root: &Path) -> Result<PinRes
         if !entry.file_type().is_file() {
             continue;
         }
+        // Audit F66: bail BEFORE reading the file body if we've already
+        // hit the file-count cap. Cheap short-circuit on zip-bombs.
+        if entries.len() >= MAX_PIN_OUTPUT_FILES {
+            return Err(anyhow!(
+                "build output exceeds max file count of {} (refusing to pin)",
+                MAX_PIN_OUTPUT_FILES
+            ));
+        }
         let rel = entry
             .path()
             .strip_prefix(root)
             .map_err(|_| anyhow!("strip_prefix failed for {:?}", entry.path()))?
             .to_path_buf();
         let rel_str = path_to_forward_slash(&rel);
+        // Audit F66: peek metadata for size BEFORE reading the file
+        // into memory, so a 1 GB output blob doesn't OOM the node.
+        let file_size = tokio::fs::metadata(entry.path())
+            .await
+            .with_context(|| format!("stat {:?}", entry.path()))?
+            .len();
+        if total_size.saturating_add(file_size) > MAX_PIN_OUTPUT_BYTES {
+            return Err(anyhow!(
+                "build output exceeds max byte count of {} (would be {}); refusing to pin",
+                MAX_PIN_OUTPUT_BYTES,
+                total_size.saturating_add(file_size)
+            ));
+        }
         let bytes = tokio::fs::read(entry.path())
             .await
             .with_context(|| format!("read {:?}", entry.path()))?;

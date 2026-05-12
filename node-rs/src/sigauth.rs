@@ -22,7 +22,9 @@
 ///      nonce the node has already observed within NONCE_RETENTION.
 ///
 /// Behaviour:
-///   - if no signature headers present:    log warning, allow (rollout phase)
+///   - if no signature headers present:    REJECT 401 by default; allow only
+///     when `SUPABA_SIGAUTH_ALLOW_MISSING=true` (rollout escape hatch — must
+///     never be set in production)
 ///   - if signature headers present + ok:  log success, record nonce, allow
 ///   - if signature headers present + bad: REJECT 401
 ///   - if nonce already seen within window: REJECT 401 (replay)
@@ -57,10 +59,28 @@ const MAX_NONCE_LEN: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigVerifyOutcome {
-    /// No signature headers at all — backwards-compat allow path.
+    /// No signature headers at all — backwards-compat allow path. Only
+    /// reachable when `SUPABA_SIGAUTH_ALLOW_MISSING=true`. Production
+    /// defaults reject this case.
     Missing,
     /// Signature present and valid.
     Verified,
+}
+
+/// Rollout escape hatch. When the env is `1`/`true`/`yes`, missing
+/// signatures continue to be accepted with a warning (audit F59 rollout
+/// behaviour). Default is reject — production must never set this.
+fn sigauth_missing_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        std::env::var("SUPABA_SIGAUTH_ALLOW_MISSING")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "yes"
+            })
+            .unwrap_or(false)
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,13 +138,18 @@ pub fn verify_request_sig(
     let ts_str = header_str(headers, "X-Kraph-Auth-Ts");
 
     if sig_b58.is_none() && nonce.is_none() && ts_str.is_none() {
-        tracing::warn!(
-            target: "supaba_node::sigauth",
-            wallet = %expected_signer_pubkey,
-            path = %path,
-            "request without per-call signature — accepted during rollout. Once all clients sign, this will become a 401."
-        );
-        return Ok(SigVerifyOutcome::Missing);
+        if sigauth_missing_allowed() {
+            tracing::warn!(
+                target: "supaba_node::sigauth",
+                wallet = %expected_signer_pubkey,
+                path = %path,
+                "request without per-call signature — accepted because SUPABA_SIGAUTH_ALLOW_MISSING=true (rollout). This MUST be unset in production."
+            );
+            return Ok(SigVerifyOutcome::Missing);
+        }
+        return Err(SigVerifyError::Unauthorized(
+            "missing per-call signature; X-Kraph-Auth-Sig, X-Kraph-Auth-Nonce, and X-Kraph-Auth-Ts are required".into(),
+        ));
     }
 
     let (sig_b58, nonce, ts_str) = match (sig_b58, nonce, ts_str) {

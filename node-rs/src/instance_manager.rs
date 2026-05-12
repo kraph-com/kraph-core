@@ -45,6 +45,13 @@ pub struct ProvisionRequest {
     /// + a CNAME to ipfs.kraph.com).
     #[serde(default, rename = "redirectUrls")]
     pub redirect_urls: Option<Vec<String>>,
+    /// Audit F69: replica endpoints that the gateway placed alongside
+    /// this primary. The list flows in via the SAME signed body as
+    /// provision, so a single owner signature authorises the primary
+    /// AND its replica registrations — no unsigned follow-up call is
+    /// needed. Empty / missing means no replicas (single-node mode).
+    #[serde(default, rename = "replicaEndpoints")]
+    pub replica_endpoints: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]

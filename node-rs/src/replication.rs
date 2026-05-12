@@ -80,11 +80,18 @@ fn replication_hmac_secret() -> Option<Vec<u8>> {
     Some(s.into_bytes())
 }
 
+/// HMAC is required by default (audit F62). Operators can opt OUT of
+/// enforcement during rollout by setting
+/// `SUPABA_REPLICATION_ALLOW_MISSING_HMAC=true` — production must NEVER
+/// set that. The legacy `SUPABA_REPLICATION_REQUIRE_HMAC` env var is
+/// retained as a no-op for forward compatibility; the new default is
+/// already strict.
 fn replication_require_hmac() -> bool {
-    matches!(
-        std::env::var("SUPABA_REPLICATION_REQUIRE_HMAC").as_deref(),
+    let allow_missing = matches!(
+        std::env::var("SUPABA_REPLICATION_ALLOW_MISSING_HMAC").as_deref(),
         Ok("true" | "1" | "yes")
-    )
+    );
+    !allow_missing
 }
 
 fn build_replication_sig(
@@ -848,6 +855,17 @@ impl ReplicationManager {
         provided_sig: Option<&str>,
         body: &[u8],
     ) -> Result<ReplicaSegment> {
+        // Audit F62: validate path-bound identifiers BEFORE doing ANY
+        // filesystem or DB work. Without these guards an attacker who
+        // reaches /replication/receive (with a leaked or missing HMAC
+        // secret) could supply traversal values in instance_id or
+        // segment_name and write attacker bytes anywhere the node
+        // process can write.
+        crate::path_safety::validate_instance_id_component(instance_id)
+            .map_err(|e| anyhow!("invalid instance_id: {e}"))?;
+        crate::path_safety::validate_segment_name(segment_name)
+            .map_err(|e| anyhow!("invalid segment_name: {e}"))?;
+
         // Authenticate the caller before doing ANY work. Without this gate,
         // an unauthenticated POST to /replication/receive could fill disk
         // or corrupt the hash chain.
@@ -913,10 +931,18 @@ impl ReplicationManager {
             }
         }
 
-        // Persist.
+        // Persist. Belt-and-braces: validators above already restrict the
+        // shape of instance_id and segment_name, but we *also* run the
+        // final path through safe_join_under so any future widening of
+        // those validators can never make the filesystem layer unsafe.
         let replica_dir = self.replica_dir(instance_id);
         fs::create_dir_all(&replica_dir).await?;
-        let stored_path = replica_dir.join(format!("{}.enc", segment_name));
+        let segment_file = format!("{}.enc", segment_name);
+        let stored_path = crate::path_safety::safe_join_under(
+            &replica_dir,
+            &[segment_file.as_str()],
+        )
+        .map_err(|e| anyhow!("replica path escape: {e}"))?;
         fs::write(&stored_path, body).await?;
 
         let row = ReplicaSegment {
@@ -952,9 +978,18 @@ impl ReplicationManager {
         instance_id: &str,
         segment_name: &str,
     ) -> Result<Option<Vec<u8>>> {
-        let path = self
-            .replica_dir(instance_id)
-            .join(format!("{}.enc", segment_name));
+        // Audit F62: same defence as receive_segment — validate ids
+        // before joining them into a filesystem path.
+        crate::path_safety::validate_instance_id_component(instance_id)
+            .map_err(|e| anyhow!("invalid instance_id: {e}"))?;
+        crate::path_safety::validate_segment_name(segment_name)
+            .map_err(|e| anyhow!("invalid segment_name: {e}"))?;
+        let segment_file = format!("{}.enc", segment_name);
+        let path = crate::path_safety::safe_join_under(
+            &self.replica_dir(instance_id),
+            &[segment_file.as_str()],
+        )
+        .map_err(|e| anyhow!("replica path escape: {e}"))?;
         if !path.exists() {
             return Ok(None);
         }
