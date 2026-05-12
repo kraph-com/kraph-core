@@ -342,6 +342,9 @@ impl InstanceManager {
             created_at: now.clone(),
             expires_at: None,
             destroyed_at: None,
+            lifecycle_state: "running".to_string(),
+            last_seen_at: None,
+            pinned_until: None,
         };
         self.db.insert_instance(&instance)?;
         self.db.bind_port_to_instance(base_port, &id)?;
@@ -543,6 +546,9 @@ impl InstanceManager {
             created_at: now.clone(),
             expires_at: None,
             destroyed_at: None,
+            lifecycle_state: "running".to_string(),
+            last_seen_at: None,
+            pinned_until: None,
         };
         self.db.insert_instance(&instance)?;
 
@@ -618,6 +624,127 @@ impl InstanceManager {
 
         info!(id = %instance_id, "instance destroyed");
         Ok(())
+    }
+
+    /// Suspend an instance: docker compose STOP every container in its
+    /// project. Volumes are preserved on disk; on the next request the
+    /// resume path runs `docker compose start` and Postgres recovers
+    /// from WAL in ~10-20 s.
+    ///
+    /// Does NOT change `instances.status` — that column tracks the
+    /// long-term lifecycle (provisioning/active/destroyed). Suspend
+    /// flips `lifecycle_state` only.
+    pub async fn suspend(&self, instance_id: &str) -> Result<()> {
+        let instance = self
+            .db
+            .get_instance_by_id(instance_id)?
+            .with_context(|| format!("instance {instance_id} not found"))?;
+
+        if instance.destroyed_at.is_some() {
+            return Err(anyhow::anyhow!(
+                "cannot suspend destroyed instance {instance_id}"
+            ));
+        }
+
+        info!(id = %instance_id, "suspending instance (docker compose stop)");
+
+        let stop_output = Command::new("docker")
+            .args(["compose", "-p", &instance.compose_project_name, "stop"])
+            .current_dir(&instance.instance_dir)
+            .output()
+            .await
+            .context("running docker compose stop")?;
+
+        if !stop_output.status.success() {
+            let stderr = String::from_utf8_lossy(&stop_output.stderr);
+            return Err(anyhow::anyhow!(
+                "docker compose stop failed for {instance_id}: {stderr}"
+            ));
+        }
+
+        self.db.set_lifecycle_state(instance_id, "suspended")?;
+        info!(id = %instance_id, "instance suspended");
+        Ok(())
+    }
+
+    /// Bring a suspended instance back online. Sets state to `starting`,
+    /// runs `docker compose start`, polls Postgres health for up to 30 s,
+    /// then sets state to `running`. On failure the state is reset to
+    /// `suspended` so the next request retries cleanly.
+    ///
+    /// **Caller responsible for serialization.** Concurrent resumes of
+    /// the same instance race each other on the docker socket. Wrap
+    /// the call in a per-instance mutex held by the HTTP handler.
+    pub async fn resume(&self, instance_id: &str) -> Result<()> {
+        let instance = self
+            .db
+            .get_instance_by_id(instance_id)?
+            .with_context(|| format!("instance {instance_id} not found"))?;
+
+        if instance.destroyed_at.is_some() {
+            return Err(anyhow::anyhow!(
+                "cannot resume destroyed instance {instance_id}"
+            ));
+        }
+
+        // Already running — nothing to do. Coalesces concurrent requests
+        // that arrive after the mutex holder finished.
+        if instance.lifecycle_state == "running" {
+            return Ok(());
+        }
+
+        self.db.set_lifecycle_state(instance_id, "starting")?;
+        info!(id = %instance_id, "resuming instance (docker compose start)");
+
+        let start_output = Command::new("docker")
+            .args(["compose", "-p", &instance.compose_project_name, "start"])
+            .current_dir(&instance.instance_dir)
+            .output()
+            .await
+            .context("running docker compose start")?;
+
+        if !start_output.status.success() {
+            let stderr = String::from_utf8_lossy(&start_output.stderr);
+            // Reset state so the next request retries from a known place.
+            let _ = self.db.set_lifecycle_state(instance_id, "suspended");
+            return Err(anyhow::anyhow!(
+                "docker compose start failed for {instance_id}: {stderr}"
+            ));
+        }
+
+        // Wait for Postgres to recover from WAL and accept connections.
+        // The pg port is exposed on the host, so we just dial TCP — full
+        // SELECT 1 ping would need a client; TCP open is enough to know
+        // the container is listening, and Kong won't proxy traffic until
+        // the upstreams are healthy anyway.
+        let pg_addr = format!("{}:{}", self.config.hostname, instance.postgres_port);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut last_err: Option<std::io::Error> = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::net::TcpStream::connect(&pg_addr).await {
+                Ok(_) => {
+                    self.db.set_lifecycle_state(instance_id, "running")?;
+                    info!(id = %instance_id, addr = %pg_addr, "instance resumed and Postgres is listening");
+                    // Bump last_seen_at so we don't immediately re-suspend.
+                    let _ = self.db.touch_instance(instance_id);
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+
+        // Postgres never came up. Leave state as 'starting' so the next
+        // request will try again — flipping back to suspended would lie
+        // about the actual container state (they ARE started, just not
+        // healthy yet) and would trigger a second `compose start` which
+        // can fail when containers are already running.
+        Err(anyhow::anyhow!(
+            "instance {instance_id} did not become healthy within 30s: last_err={:?}",
+            last_err
+        ))
     }
 
     pub async fn get_health(&self, instance_id: &str) -> Result<Option<InstanceHealth>> {

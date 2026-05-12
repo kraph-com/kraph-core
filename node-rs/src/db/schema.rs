@@ -32,7 +32,20 @@ CREATE TABLE IF NOT EXISTS instances (
     wal_encryption_key  TEXT NOT NULL DEFAULT '',
     created_at          TEXT NOT NULL DEFAULT (datetime('now')),
     expires_at          TEXT,
-    destroyed_at        TEXT
+    destroyed_at        TEXT,
+    /* Idle-suspend lifecycle. Compose containers are stopped (state
+       'suspended') after SUPABA_IDLE_SUSPEND_SECS without proxy traffic
+       and brought back ('starting' → 'running') on the first hit. The
+       `status` column above tracks longer-term lifecycle (provisioning /
+       active / destroyed); `lifecycle_state` is the live RAM state. */
+    lifecycle_state     TEXT NOT NULL DEFAULT 'running',
+    /* Unix epoch seconds — bumped by every proxied hit. NULL on a fresh
+       provision until the first real request lands. */
+    last_seen_at        INTEGER,
+    /* Unix epoch seconds — when set and > now(), the idle tracker skips
+       this row. Bumped by the gateway after a successful kraph_pin_instance
+       payment. NULL = not pinned, idle-suspend applies normally. */
+    pinned_until        INTEGER
 );
 "#;
 
@@ -160,4 +173,10 @@ pub const SOFT_MIGRATIONS: &[&str] = &[
     "ALTER TABLE wal_segments ADD COLUMN chain_index INTEGER NOT NULL DEFAULT 0",
     // Backfill `protected` flag on instance_env for the user-only secrets path.
     "ALTER TABLE instance_env ADD COLUMN protected INTEGER NOT NULL DEFAULT 0",
+    // Idle-suspend lifecycle columns (default 'running' so existing rows
+    // are treated as live and won't be eligible for suspend until they
+    // accrue a last_seen_at via the proxy paths).
+    "ALTER TABLE instances ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'running'",
+    "ALTER TABLE instances ADD COLUMN last_seen_at INTEGER",
+    "ALTER TABLE instances ADD COLUMN pinned_until INTEGER",
 ];

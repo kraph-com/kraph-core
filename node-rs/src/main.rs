@@ -43,6 +43,15 @@ struct AppState {
     warm_pool: WarmPool,
     replication: Arc<ReplicationManager>,
     db: Arc<Database>,
+    /// Per-instance mutex serializing resume / suspend operations on the
+    /// docker socket. Concurrent first-hit requests on a suspended
+    /// instance all `lock().await` the same mutex; only one runs
+    /// `compose start`, the others observe state=running on retry.
+    /// Lazily populated; entries are never removed (cheap — one Arc<Mutex>
+    /// per ever-touched instance, ~50 bytes).
+    resume_locks: tokio::sync::Mutex<
+        std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    >,
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         warm_pool,
         replication,
         db: db.clone(),
+        resume_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // Background tasks.
@@ -95,6 +105,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/instances/:id", delete(destroy_handler))
         .route("/instances/:id/health", get(instance_health_handler))
         .route("/instances/:id/extend", post(extend_handler))
+        // Idle-suspend lifecycle. /touch is hit by every proxy hop to
+        // bump last_seen_at; /resume cold-starts a suspended stack
+        // (compose start + pg health poll, coalesced via resume_locks);
+        // /pin is the gateway hook after a kraph_pin_instance x402
+        // settlement, extending pinned_until.
+        .route("/instances/:id/touch", post(touch_handler))
+        .route("/instances/:id/resume", post(resume_handler))
+        .route("/instances/:id/pin", post(pin_handler))
         // IPFS pinning. Default axum body limit is 2MB, which silently
         // rejects most frontend bundles. 50MB matches the gateway's
         // express.json() ceiling so an agent-supplied SPA flows end to end.
@@ -468,6 +486,198 @@ async fn extend_handler(
         .manager
         .extend_instance(&id, &req.wallet, req.duration_secs)?;
     Ok(Json(serde_json::json!({ "status": "extended", "id": id })).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Idle-suspend lifecycle handlers
+// ---------------------------------------------------------------------------
+//
+// /touch: cheap bump of last_seen_at. The gateway's subdomain proxy hits
+// this on every forwarded request so the idle tracker has fresh state.
+// Sigauth uses the instance's bound wallet — but during the rollout
+// we'd rather have updates land than have the proxy fall back to "not
+// signed → request blocked". So missing-sig is treated as a warning and
+// the bump still applies (the worst case is a third party can prevent
+// idle-suspend of someone else's instance, which is a free-RAM nuisance
+// not a security hole).
+//
+// /resume: cold-start the compose stack. Serialized by resume_locks per
+// instance id so concurrent first-hit requests share a single compose
+// start. Sigauth optional same as /touch — gateway signs when it can.
+//
+// /pin: gateway-only. Operator-pubkey sigauth so a hostile agent can't
+// freely extend pinned_until without paying for it.
+
+#[derive(Deserialize)]
+struct TouchRequest {
+    wallet: String,
+}
+
+async fn touch_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let req: TouchRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
+
+    // Verify the caller owns the instance before stamping. We don't
+    // hard-fail on missing sigs (rollout phase) but we DO verify
+    // wallet→instance binding regardless.
+    let instance = state
+        .db
+        .get_instance(&id, &req.wallet)?
+        .ok_or_else(|| AppError(anyhow::anyhow!("instance {id} not found for wallet")))?;
+    drop(instance);
+
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{id}/touch"),
+        &body_bytes,
+        &req.wallet,
+    ) {
+        // Soft-fail during rollout — the bump is low-risk.
+        tracing::debug!(id, error = %e, "/touch sigauth missing/invalid (soft-accept)");
+    }
+
+    state.db.touch_instance(&id)?;
+    Ok(Json(serde_json::json!({ "status": "touched", "id": id })).into_response())
+}
+
+#[derive(Deserialize)]
+struct ResumeRequest {
+    wallet: String,
+}
+
+async fn resume_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let req: ResumeRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
+
+    let instance = state
+        .db
+        .get_instance(&id, &req.wallet)?
+        .ok_or_else(|| AppError(anyhow::anyhow!("instance {id} not found for wallet")))?;
+
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{id}/resume"),
+        &body_bytes,
+        &req.wallet,
+    ) {
+        tracing::debug!(id, error = %e, "/resume sigauth missing/invalid (soft-accept)");
+    }
+
+    // Fast-path: already running. Skip the lock + bump last_seen.
+    if instance.lifecycle_state == "running" {
+        state.db.touch_instance(&id)?;
+        return Ok(Json(serde_json::json!({
+            "status": "running",
+            "id": id,
+            "already_running": true
+        }))
+        .into_response());
+    }
+
+    // Acquire the per-instance lock, then re-check state inside the lock
+    // (another caller may have resumed while we were waiting).
+    let lock = {
+        let mut map = state.resume_locks.lock().await;
+        map.entry(id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = lock.lock().await;
+
+    let refreshed = state
+        .db
+        .get_instance_by_id(&id)?
+        .ok_or_else(|| AppError(anyhow::anyhow!("instance {id} disappeared during resume")))?;
+    if refreshed.lifecycle_state == "running" {
+        state.db.touch_instance(&id)?;
+        return Ok(Json(serde_json::json!({
+            "status": "running",
+            "id": id,
+            "already_running": true
+        }))
+        .into_response());
+    }
+
+    state.manager.resume(&id).await?;
+    Ok(Json(serde_json::json!({
+        "status": "running",
+        "id": id,
+        "already_running": false
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct PinRequest {
+    /// Gateway's operator pubkey — used for sigauth verification (the
+    /// gateway is the only party allowed to call /pin since it's the
+    /// gatekeeper of the x402 settlement that funds the pin).
+    operator: String,
+    /// Unix epoch seconds the pin should run through. Idempotent against
+    /// the current value: server takes max(existing, until_ts).
+    until_ts: i64,
+}
+
+async fn pin_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let req: PinRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
+
+    // /pin MUST be hard-gated. A free /pin endpoint = free RAM reservation
+    // for anyone, breaking the entire monetization. The gateway signs
+    // with its operator keypair after a successful x402 settlement;
+    // hostile callers without that key are rejected.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{id}/pin"),
+        &body_bytes,
+        &req.operator,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": format!("/pin sigauth: {e}") })),
+        )
+            .into_response());
+    }
+
+    // The signing pubkey must match the SUPABA_OPERATOR_ADDRESS configured
+    // on this node — checks at startup. Re-checking here costs nothing.
+    if let Some(expected) = state.config.operator_address.as_deref() {
+        if expected != req.operator {
+            return Ok((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "operator pubkey does not match SUPABA_OPERATOR_ADDRESS"
+                })),
+            )
+                .into_response());
+        }
+    }
+
+    let resolved = state.db.set_pinned_until(&id, req.until_ts)?;
+    Ok(Json(serde_json::json!({
+        "status": "pinned",
+        "id": id,
+        "pinned_until": resolved
+    }))
+    .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -3131,6 +3341,64 @@ fn spawn_background_tasks(state: Arc<AppState>, config: &Config) {
             }
         }
     });
+
+    // Idle-suspend sweeper. Off by default (SUPABA_IDLE_SUSPEND_SECS=0
+    // skips the sweep entirely) so deploying a new node-rs binary
+    // before the gateway resume-on-demand path is wired doesn't strand
+    // suspended instances behind a gateway that doesn't know how to wake
+    // them. When the gateway has both /resume + the proxy detection,
+    // bump SUPABA_IDLE_SUSPEND_SECS to a positive value (e.g. 900).
+    if config.idle_suspend_secs > 0 {
+        let idle_state = state.clone();
+        let idle_secs = config.idle_suspend_secs;
+        let sweep_interval = Duration::from_secs(config.idle_sweep_interval_secs.max(10));
+        tokio::spawn(async move {
+            // Stagger startup so we don't race provision + suspend on cold start.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let mut interval = tokio::time::interval(sweep_interval);
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                interval.tick().await;
+                let candidates = match idle_state.db.list_idle_running_instances(idle_secs as i64) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "idle-sweep: list query failed");
+                        continue;
+                    }
+                };
+                for instance in candidates {
+                    // Skip if a concurrent resume is in flight (we'd race
+                    // the docker socket and end up with a half-started
+                    // stack). The resume_locks map in AppState serializes
+                    // resume on the HTTP side; we mirror that here.
+                    let lock = {
+                        let mut map = idle_state.resume_locks.lock().await;
+                        map.entry(instance.id.clone())
+                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                            .clone()
+                    };
+                    let _guard = match lock.try_lock() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            // Resume in progress for this id — skip this tick.
+                            continue;
+                        }
+                    };
+                    if let Err(e) = idle_state.manager.suspend(&instance.id).await {
+                        warn!(id = %instance.id, error = %e, "idle-sweep: suspend failed");
+                    } else {
+                        info!(
+                            id = %instance.id,
+                            idle_secs,
+                            "idle-sweep: instance suspended"
+                        );
+                    }
+                }
+            }
+        });
+    } else {
+        info!("idle-suspend is DISABLED (SUPABA_IDLE_SUSPEND_SECS=0)");
+    }
 
     // Warm pool maintenance.
     let warm_state = state.clone();

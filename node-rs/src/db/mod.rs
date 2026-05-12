@@ -222,6 +222,27 @@ pub struct Instance {
     pub created_at: String,
     pub expires_at: Option<String>,
     pub destroyed_at: Option<String>,
+    /// Live RAM lifecycle: `running` | `suspended` | `starting`. Defaults to
+    /// `running` on fresh provision. The idle tracker transitions
+    /// running → suspended after SUPABA_IDLE_SUSPEND_SECS without proxy
+    /// traffic; resume flips it through `starting` back to `running`.
+    /// Orthogonal to `status` (provisioning / active / destroyed).
+    #[serde(default = "default_lifecycle_state")]
+    pub lifecycle_state: String,
+    /// Unix epoch seconds — bumped by every proxied hit (Kong / Studio /
+    /// PostgREST / functions invoke / subdomain proxy). `None` until the
+    /// first real request after provision; the idle tracker treats `None`
+    /// as "use created_at" so fresh instances aren't suspended before
+    /// they're ever used.
+    pub last_seen_at: Option<i64>,
+    /// Unix epoch seconds — when set and `> now()`, the idle tracker
+    /// skips this row. Bumped by the gateway after a successful
+    /// `kraph_pin_instance` x402 settlement.
+    pub pinned_until: Option<i64>,
+}
+
+fn default_lifecycle_state() -> String {
+    "running".to_string()
 }
 
 /// Zeroize secrets when the instance is dropped.
@@ -437,6 +458,78 @@ impl Database {
         )?;
         debug!(id, status, "instance status updated");
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Idle-suspend lifecycle helpers
+    // ------------------------------------------------------------------
+
+    /// Bump `last_seen_at` to the current unix-epoch seconds. Cheap — single
+    /// row UPDATE keyed by primary key. Called on every proxied request
+    /// so the idle tracker can decide what's stale.
+    pub fn touch_instance(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "UPDATE instances SET last_seen_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Transition lifecycle_state. Caller is responsible for the actual
+    /// docker compose start/stop; this just records the DB-side state so
+    /// the proxy paths know whether the containers are alive.
+    pub fn set_lifecycle_state(&self, id: &str, new_state: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "UPDATE instances SET lifecycle_state = ?1 WHERE id = ?2",
+            params![new_state, id],
+        )?;
+        debug!(id, new_state, "instance lifecycle_state updated");
+        Ok(())
+    }
+
+    /// Set `pinned_until` to the max of its current value and `until_ts`.
+    /// Idempotent — re-pinning while already pinned only extends the
+    /// deadline forward, never backward. Returns the resulting deadline.
+    pub fn set_pinned_until(&self, id: &str, until_ts: i64) -> Result<i64> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "UPDATE instances SET pinned_until = MAX(COALESCE(pinned_until, 0), ?1) WHERE id = ?2",
+            params![until_ts, id],
+        )?;
+        let resolved: i64 = conn.query_row(
+            "SELECT pinned_until FROM instances WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        Ok(resolved)
+    }
+
+    /// Find instances eligible for idle-suspend: status='active' (i.e. not
+    /// destroyed), lifecycle_state='running', not currently pinned, and
+    /// idle longer than `idle_secs`. `last_seen_at IS NULL` falls back to
+    /// `created_at` so a freshly provisioned instance that's never been
+    /// hit can still be suspended after the timeout (no one's using it).
+    pub fn list_idle_running_instances(&self, idle_secs: i64) -> Result<Vec<Instance>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - idle_secs;
+        let mut stmt = conn.prepare(
+            r#"SELECT * FROM instances
+               WHERE destroyed_at IS NULL
+                 AND status = 'active'
+                 AND lifecycle_state = 'running'
+                 AND (pinned_until IS NULL OR pinned_until < ?1)
+                 AND COALESCE(
+                       last_seen_at,
+                       CAST(strftime('%s', created_at) AS INTEGER)
+                     ) < ?2"#,
+        )?;
+        let rows = stmt.query_map(params![now, cutoff], row_to_instance)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn destroy_instance(&self, id: &str) -> Result<()> {
@@ -1117,5 +1210,10 @@ fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<Instance> {
         created_at: row.get("created_at")?,
         expires_at: row.get("expires_at")?,
         destroyed_at: row.get("destroyed_at")?,
+        lifecycle_state: row
+            .get::<_, Option<String>>("lifecycle_state")?
+            .unwrap_or_else(default_lifecycle_state),
+        last_seen_at: row.get("last_seen_at")?,
+        pinned_until: row.get("pinned_until")?,
     })
 }

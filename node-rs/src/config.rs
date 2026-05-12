@@ -103,11 +103,29 @@ pub struct Config {
     pub facilitator_url: String,
     /// USDC SPL token mint address.
     pub usdc_mint: String,
+    /// Gateway operator wallet pubkey (base58). Used as the `expected_signer`
+    /// for endpoints that only the gateway should call — currently just
+    /// `POST /instances/:id/pin`, where free access would defeat the
+    /// $10/month pin paywall. `None` means "don't enforce operator
+    /// sigauth" (early-rollout convenience; production should set
+    /// `SUPABA_OPERATOR_ADDRESS`).
+    pub operator_address: Option<String>,
 
     /// Seconds between heartbeat pings to the facilitator.
     pub heartbeat_interval_secs: u64,
     /// Seconds between expired-instance cleanup sweeps.
     pub cleanup_interval_secs: u64,
+    /// Seconds an instance can go without any proxied traffic before the
+    /// idle tracker docker-compose-stops it. `0` (the default) disables
+    /// the idle tracker entirely — important during the rollout because
+    /// the gateway needs the matching resume-on-demand path before
+    /// suspending instances is safe (otherwise a suspended instance is
+    /// just a broken endpoint). Set to a non-zero value (e.g. `900`
+    /// = 15 min) ONLY after the gateway can resume suspended instances.
+    pub idle_suspend_secs: u64,
+    /// Seconds between idle-tracker sweeps. Cheap, runs whether or not
+    /// the tracker is enabled — when disabled it's a no-op.
+    pub idle_sweep_interval_secs: u64,
     /// Seconds between WAL archive runs.
     pub wal_archive_interval_secs: u64,
     /// Seconds between encrypted WAL replication runs (process_new_segments
@@ -201,8 +219,12 @@ impl Default for Config {
             operator_keypair_path: PathBuf::from("/etc/supaba/operator.json"),
             facilitator_url: "http://localhost:8080".into(),
             usdc_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+            operator_address: None,
             heartbeat_interval_secs: 300,
             cleanup_interval_secs: 60,
+            // Disabled by default — see field doc.
+            idle_suspend_secs: 0,
+            idle_sweep_interval_secs: 60,
             wal_archive_interval_secs: 300,
             wal_replication_interval_secs: 10,
             docker_socket_path: "/var/run/docker.sock".into(),
@@ -313,6 +335,10 @@ impl Config {
             ),
             facilitator_url: env_or("SUPABA_FACILITATOR_URL", defaults.facilitator_url),
             usdc_mint: env_or("SUPABA_USDC_MINT", defaults.usdc_mint),
+            operator_address: std::env::var("SUPABA_OPERATOR_ADDRESS").ok().and_then(|v| {
+                let t = v.trim();
+                if t.is_empty() { None } else { Some(t.to_string()) }
+            }),
             heartbeat_interval_secs: env_or_u64(
                 "SUPABA_HEARTBEAT_INTERVAL_SECS",
                 defaults.heartbeat_interval_secs,
@@ -320,6 +346,14 @@ impl Config {
             cleanup_interval_secs: env_or_u64(
                 "SUPABA_CLEANUP_INTERVAL_SECS",
                 defaults.cleanup_interval_secs,
+            ),
+            idle_suspend_secs: env_or_u64(
+                "SUPABA_IDLE_SUSPEND_SECS",
+                defaults.idle_suspend_secs,
+            ),
+            idle_sweep_interval_secs: env_or_u64(
+                "SUPABA_IDLE_SWEEP_INTERVAL_SECS",
+                defaults.idle_sweep_interval_secs,
             ),
             wal_archive_interval_secs: env_or_u64(
                 "SUPABA_WAL_ARCHIVE_INTERVAL_SECS",

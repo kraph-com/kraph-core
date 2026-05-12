@@ -6,9 +6,13 @@ skip-lint = false
 
 [programs.localnet]
 supaba_registry = "9B6JGBf3djjquA5mx9VsnTb9GTyMMjL1c4F2wpY5W9dv"
+kraph_credits_hook = "11111111111111111111111111111111"
 
 [programs.devnet]
 supaba_registry = "9B6JGBf3djjquA5mx9VsnTb9GTyMMjL1c4F2wpY5W9dv"
+
+[programs.mainnet]
+kraph_credits_hook = "11111111111111111111111111111111"
 
 [registry]
 url = "https://api.apr.dev"
