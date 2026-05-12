@@ -1196,12 +1196,36 @@ CPUSET_CPUS={cpuset}
         instance_id: &str,
         wallet_pubkey: &str,
         extras: &[String],
+        site_url_override: Option<&str>,
     ) -> Result<String> {
         // Ownership check first — defence in depth (the HTTP handler also
         // checks).
         let inst = self
             .get_instance(instance_id, wallet_pubkey)?
             .ok_or_else(|| anyhow::anyhow!("instance not found or not owned"))?;
+
+        // Validate optional site_url override BEFORE any FS work.
+        // Magic links land at <SITE_URL>#access_token=…; if SITE_URL is
+        // not pointing at a real page (e.g. the instance API root has
+        // no route for bare /api so Kong returns "no Route matched"),
+        // the user sees a JSON error instead of being signed in.
+        let validated_site_url: Option<String> = if let Some(u) = site_url_override {
+            let trimmed = u.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                let lower = trimmed.to_ascii_lowercase();
+                if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+                    bail!("site_url must start with http:// or https://");
+                }
+                if trimmed.contains(',') || trimmed.split_whitespace().count() > 1 {
+                    bail!("site_url must not contain commas or whitespace");
+                }
+                Some(trimmed.to_string())
+            }
+        } else {
+            None
+        };
 
         let env_path = std::path::PathBuf::from(&inst.instance_dir).join(".env");
         let body = std::fs::read_to_string(&env_path)
@@ -1262,6 +1286,38 @@ CPUSET_CPUS={cpuset}
         if !found_line {
             rebuilt.push(new_value.clone());
         }
+
+        // Optionally also update the SITE_URL / API_EXTERNAL_URL keys
+        // GoTrue uses as the magic-link redirect target. Without this,
+        // SITE_URL defaults to https://<id>.<public_host>/api which is
+        // the bare API root — Kong has no route for that path, so
+        // magic-link clicks land on "no Route matched". After pinning
+        // an SPA the agent should call this with site_url set to the
+        // pinned URL so token-bearing fragments land on a page that
+        // can read them.
+        if let Some(new_site) = validated_site_url.as_ref() {
+            let keys_to_update = [
+                "GOTRUE_SITE_URL",
+                "GOTRUE_API_EXTERNAL_URL",
+                "API_EXTERNAL_URL",
+                "SITE_URL",
+                "SUPABASE_PUBLIC_URL",
+            ];
+            for key in keys_to_update {
+                let mut found = false;
+                for line in rebuilt.iter_mut() {
+                    if line.starts_with(&format!("{key}=")) {
+                        *line = format!("{key}={new_site}");
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    rebuilt.push(format!("{key}={new_site}"));
+                }
+            }
+        }
+
         let new_body = rebuilt.join("\n");
         std::fs::write(&env_path, &new_body)
             .with_context(|| format!("writing {:?}", env_path))?;

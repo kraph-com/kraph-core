@@ -1627,7 +1627,16 @@ struct AppendRedirectUrlsRequest {
     /// May include `**` glob wildcards (GoTrue supports them in path
     /// segments). Idempotent — duplicates with the existing list are
     /// dropped server-side.
+    #[serde(default)]
     urls: Vec<String>,
+    /// Optional: also update GOTRUE_SITE_URL / API_EXTERNAL_URL /
+    /// SITE_URL / SUPABASE_PUBLIC_URL on the instance to this value.
+    /// Use after pinning an SPA so magic-link clicks land on the
+    /// SPA (which can read the access_token from the URL fragment)
+    /// instead of the bare API root (which Kong has no route for
+    /// and returns "no Route matched"). Must be http:// or https://.
+    #[serde(default, rename = "siteUrl")]
+    site_url: Option<String>,
 }
 
 async fn append_redirect_urls_handler(
@@ -1658,7 +1667,12 @@ async fn append_redirect_urls_handler(
     }
     match state
         .manager
-        .append_redirect_urls(&id, &req.wallet_pubkey, &req.urls)
+        .append_redirect_urls(
+            &id,
+            &req.wallet_pubkey,
+            &req.urls,
+            req.site_url.as_deref(),
+        )
         .await
     {
         Ok(allow_list) => Ok((
