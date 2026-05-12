@@ -1,0 +1,70 @@
+# Reproducible OVMF build for AMD SEV-SNP and Intel TDX
+#
+# This builds UEFI firmware from a pinned edk2 commit with SEV-SNP and TDX
+# support enabled. The output is a deterministic binary whose hash forms
+# part of the VM's attestation measurement.
+#
+# Build: docker build -f Dockerfile.ovmf -o out .
+
+FROM ubuntu:24.04 AS builder
+
+ARG EDK2_COMMIT=edk2-stable202405
+ARG NASM_VERSION=2.16.03
+ARG IASL_VERSION=20230628
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies — pinned versions for reproducibility
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    python3 \
+    python3-venv \
+    uuid-dev \
+    nasm=${NASM_VERSION}* \
+    iasl \
+    gcc-12 \
+    g++-12 \
+    ca-certificates \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 100 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone edk2 at pinned commit
+WORKDIR /build
+RUN git clone --depth 1 --branch ${EDK2_COMMIT} \
+    https://github.com/tianocore/edk2.git && \
+    cd edk2 && \
+    git submodule update --init --depth 1
+
+WORKDIR /build/edk2
+
+# Set up build environment
+RUN bash -c "source edksetup.sh && make -C BaseTools -j$(nproc)"
+
+# ─── Build SEV-SNP OVMF ──────────────────────────────────────────────────────
+# AmdSevX64.dsc includes SNP support, attestation hooks, and no SMM
+RUN bash -c "source edksetup.sh && \
+    build -a X64 -t GCC5 -b RELEASE \
+    -p OvmfPkg/AmdSev/AmdSevX64.dsc \
+    -D DEBUG_ON_SERIAL_PORT=TRUE \
+    -D FD_SIZE_4MB \
+    -D NETWORK_IP6_ENABLE=FALSE \
+    -D NETWORK_HTTP_BOOT_ENABLE=FALSE \
+    -D NETWORK_TLS_ENABLE=FALSE \
+    -D TPM2_ENABLE=TRUE \
+    -D SECURE_BOOT_ENABLE=FALSE"
+
+# ─── Build TDX OVMF (TDVF) ──────────────────────────────────────────────────
+RUN bash -c "source edksetup.sh && \
+    build -a X64 -t GCC5 -b RELEASE \
+    -p OvmfPkg/IntelTdx/IntelTdxX64.dsc \
+    -D DEBUG_ON_SERIAL_PORT=TRUE \
+    -D FD_SIZE_4MB \
+    -D TPM2_ENABLE=TRUE"
+
+# ─── Output stage ─────────────────────────────────────────────────────────────
+FROM scratch AS output
+
+COPY --from=builder /build/edk2/Build/AmdSev/RELEASE_GCC5/FV/OVMF.fd /ovmf-sev.fd
+COPY --from=builder /build/edk2/Build/IntelTdx/RELEASE_GCC5/FV/OVMF.fd /ovmf-tdx.fd

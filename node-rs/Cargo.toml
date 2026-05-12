@@ -1,0 +1,77 @@
+[package]
+name = "supaba-node"
+version = "0.1.0"
+edition = "2021"
+description = "Supaba decentralized node — provisions and manages Supabase instances inside TEEs"
+license = "MIT"
+
+[[bin]]
+name = "supaba-node"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Docker API
+bollard = "0.17"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Crypto
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+zeroize = { version = "1.3", features = ["derive"] }
+# Per-call request signature verification (mitigation #1: a compromised
+# gateway can otherwise deploy hostile edge functions / read env vars on
+# any instance because gateway -> node calls were authenticated only by an
+# X-Wallet-Pubkey claim. With these we can verify an ed25519 signature from
+# the instance owner's Solana key on each state-changing request.)
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+bs58 = "0.5"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP client (for WAL replication and Solana RPC)
+# Use native-tls to avoid ring's gcc requirement on Windows
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "multipart", "stream"] }
+futures-util = "0.3"
+
+# Utilities
+nanoid = "0.4"
+base64 = "0.22"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Sandboxed frontend builds: temp workspace + recursive walk of the build
+# output before we pin to Kubo. Used by /instances/:id/build-and-pin.
+tempfile = "3"
+walkdir = "2"
+# URL encoding for postgres-password embedding in the migration target URL.
+urlencoding = "2"
+
+# JWT (for Supabase key generation)
+# Use hmac/sha2 directly instead of jsonwebtoken to avoid ring dependency
+hmac = "0.12"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

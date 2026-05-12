@@ -1,0 +1,2877 @@
+mod config;
+mod db;
+mod db_migration;
+mod frontend_build;
+mod health;
+mod instance_manager;
+mod integrity;
+mod replication;
+mod sigauth;
+mod studio_proxy;
+mod tee;
+mod warm_pool;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::{delete, get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
+use sha2::Digest as _;
+use tokio::signal;
+use tracing::{error, info, warn};
+
+use config::Config;
+use db::Database;
+use instance_manager::{InstanceManager, ProvisionRequest};
+use replication::ReplicationManager;
+use warm_pool::WarmPool;
+
+// ---------------------------------------------------------------------------
+// Shared application state
+// ---------------------------------------------------------------------------
+
+struct AppState {
+    config: Config,
+    manager: InstanceManager,
+    warm_pool: WarmPool,
+    replication: Arc<ReplicationManager>,
+    db: Arc<Database>,
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Tracing.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "supaba_node=info,tower_http=info".into()),
+        )
+        .init();
+
+    // Configuration.
+    let config = Config::from_env()?;
+
+    // Startup banner.
+    print_banner(&config);
+
+    // Database.
+    let db = Arc::new(Database::new(&config.data_dir)?);
+
+    // Instance manager + warm pool + replication.
+    let config_arc = Arc::new(config.clone());
+    let manager = InstanceManager::new(&config, db.clone());
+    let warm_pool = WarmPool::new(config_arc.clone(), db.clone());
+    let replication = Arc::new(ReplicationManager::new(config_arc.clone(), db.clone()));
+
+    let state = Arc::new(AppState {
+        config: config.clone(),
+        manager,
+        warm_pool,
+        replication,
+        db: db.clone(),
+    });
+
+    // Background tasks.
+    spawn_background_tasks(state.clone(), &config);
+
+    // Axum router.
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/stats", get(stats_handler))
+        .route("/instances", post(provision_handler))
+        .route("/instances", get(list_instances_handler))
+        .route("/instances/:id", get(get_instance_handler))
+        .route("/instances/:id", delete(destroy_handler))
+        .route("/instances/:id/health", get(instance_health_handler))
+        .route("/instances/:id/extend", post(extend_handler))
+        // IPFS pinning. Default axum body limit is 2MB, which silently
+        // rejects most frontend bundles. 50MB matches the gateway's
+        // express.json() ceiling so an agent-supplied SPA flows end to end.
+        .route(
+            "/ipfs/pin",
+            post(ipfs_pin_handler).layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
+        )
+        .route("/ipfs/:cid", get(ipfs_get_handler))
+        // Sandboxed frontend builder — agent-driven via kraph_github_build_frontend.
+        // Body is small (just URLs + commands), the heavy work happens inside
+        // an ephemeral container against a tarball downloaded from GitHub.
+        .route("/instances/:id/build-and-pin", post(build_and_pin_handler))
+        // Append URLs to GOTRUE_URI_ALLOW_LIST + restart the auth container.
+        // Used by kraph_auth_set_redirect_urls so the magic-link allow list
+        // can grow after the IPFS CID is known (or after kraph_buy_domain).
+        .route(
+            "/instances/:id/auth/redirect-urls",
+            post(append_redirect_urls_handler),
+        )
+        // Database migration — Supabase / generic Postgres → Kraph instance.
+        // Source-probe is fast (one psql query); start kicks off a docker job
+        // that pipes pg_dump | pg_restore. Cancel kills the container.
+        .route("/instances/:id/migrate/probe", post(migrate_probe_handler))
+        .route("/instances/:id/migrate", post(migrate_start_handler))
+        .route(
+            "/instances/:id/migrate/cutover/:pubsub",
+            post(migrate_cutover_handler),
+        )
+        .route(
+            "/instances/:id/migrate/:container",
+            delete(migrate_cancel_handler),
+        )
+        // Integrity (Layer 2: Merkle state commitments)
+        .route("/instances/:id/integrity/root", get(integrity_root_handler))
+        // TEE attestation
+        .route("/instances/:id/attest", post(attest_handler))
+        // Edge Functions
+        .route("/instances/:id/functions/deploy", post(deploy_function_handler))
+        .route("/instances/:id/functions", get(list_functions_handler))
+        .route("/instances/:id/functions/:name/source", get(get_function_source_handler))
+        // Per-instance edge-function env vars (scoped to the functions container,
+        // not the whole Supabase stack). Mutations live-reload by recreating
+        // only the `functions` service; no Postgres restart involved.
+        .route("/instances/:id/env", post(set_env_handler))
+        .route("/instances/:id/env", get(list_env_handler))
+        .route("/instances/:id/env/keys", get(list_env_keys_handler))
+        .route("/instances/:id/env/apply", post(apply_env_handler))
+        .route("/instances/:id/env/:key", delete(delete_env_handler))
+        // Replication
+        .route("/instances/:id/replicas", post(add_replica_handler))
+        .route("/instances/:id/replicas", get(list_replicas_handler))
+        .route("/instances/:id/replicas/force-switch-wal", post(force_switch_wal_handler))
+        .route(
+            "/replication/receive",
+            // Postgres WAL segments are 16 MB by default. Allow up to 64 MB
+            // per request to leave headroom for non-default WAL sizes and the
+            // ChaCha20-Poly1305 nonce + tag overhead.
+            post(receive_replication_handler).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route("/replication/:instance_id/segments", get(list_replica_segments_handler))
+        // Studio auth gate (Phase 3, subdomain mode). The exchange endpoint
+        // verifies the gateway-minted HMAC token and drops a wildcard-Domain
+        // cookie. forward-auth is what Caddy hits on every Studio request
+        // to validate that cookie before forwarding to 127.0.0.1:<studio_port>.
+        .route("/__kraph/studio/exchange", get(studio_exchange_handler))
+        .route("/__kraph/studio/forward-auth", get(studio_forward_auth_handler))
+        // CORS: allow the landing page (and any other browser-based agent)
+        // to fetch /health, /stats, /replication/*/segments. The node API has
+        // no authenticated state that a cross-origin GET could exfiltrate —
+        // everything sensitive (wallet ops, provision) requires POST body
+        // auth — so permissive CORS is safe here.
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .with_state(state);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.api_port));
+    info!(%addr, "HTTP server listening");
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    info!("server shut down cleanly");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+async fn health_handler() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+async fn stats_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let stats = state.manager.get_stats()?;
+    Ok(Json(stats))
+}
+
+async fn provision_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let req: ProvisionRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
+    // Audit F43: sigauth on provision. The request's `wallet_pubkey`
+    // field IS the wallet that will own the new instance — a forged
+    // gateway claim there means the wrong wallet gets billed (x402
+    // delegation drains the claimed wallet's USDC) and ends up as the
+    // owner. Verify the signature is from that wallet before any
+    // docker/db work.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        "/instances",
+        &body_bytes,
+        &req.wallet_pubkey,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
+    // Try the warm pool first if anything is in it. provision_from_warm is
+    // also async-friendly because it does down+up in <2s when the warm
+    // instance is healthy.
+    let result = if let Some(warm_inst) = state.warm_pool.take().await {
+        info!(
+            warm_project = %warm_inst.compose_project_name,
+            "using warm instance for fast provisioning"
+        );
+        match state
+            .manager
+            .provision_from_warm(req.clone(), warm_inst)
+            .await
+        {
+            Ok(result) => {
+                let replenish_state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = replenish_state.warm_pool.replenish().await {
+                        warn!(error = %e, "warm pool replenish after take failed");
+                    }
+                });
+                result
+            }
+            Err(e) => {
+                warn!(error = %e, "warm instance assignment failed, falling back to async cold provision");
+                state.manager.prepare_provision(req).await?
+            }
+        }
+    } else {
+        // Cold path: prepare metadata synchronously (returns the
+        // credentials in <1s) and run docker compose up in the background.
+        // This keeps the HTTP response well within the Solana blockhash
+        // window so x402 settlement on a paid /instances call succeeds
+        // even when the underlying Supabase stack takes a minute to come
+        // up. The agent can poll GET /instances/:id/health for the
+        // running/degraded transition.
+        state.manager.prepare_provision(req).await?
+    };
+
+    // If the result came back as 'provisioning' it means we took the cold
+    // path (or warm fast path is somehow still in flight). Spawn the docker
+    // work in the background. For 'running' (warm pool succeeded) the work
+    // is already done.
+    if result.status == "provisioning" {
+        let bg_state = state.clone();
+        let instance_id = result.id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = bg_state.manager.finalize_provision(&instance_id).await {
+                error!(instance_id = %instance_id, error = %e, "background finalize_provision failed");
+            }
+            // Configure WAL archiving once Postgres is up. The 5s grace
+            // period inside finalize_provision's wait_for_health is usually
+            // enough, but we add a small extra wait to be safe.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if let Err(e) = bg_state
+                .replication
+                .configure_wal_archiving(&instance_id)
+                .await
+            {
+                warn!(instance_id = %instance_id, error = %e, "WAL archiving configuration failed");
+            }
+        });
+    } else {
+        // Already running (warm path) — still configure archiving.
+        let configure_state = state.clone();
+        let instance_id = result.id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if let Err(e) = configure_state
+                .replication
+                .configure_wal_archiving(&instance_id)
+                .await
+            {
+                warn!(instance_id = %instance_id, error = %e, "WAL archiving configuration failed");
+            }
+        });
+    }
+
+    // 202 Accepted communicates "I'm working on it" semantics for the cold
+    // path. The body still includes everything the agent needs to start
+    // using the instance once provisioning completes.
+    let status_code = if result.status == "provisioning" {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status_code, Json(result)).into_response())
+}
+
+#[derive(Deserialize)]
+struct ListQuery {
+    wallet: String,
+    status: Option<String>,
+}
+
+async fn list_instances_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ListQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let instances =
+        state
+            .manager
+            .list_instances(&q.wallet, q.status.as_deref())?;
+    Ok(Json(instances))
+}
+
+#[derive(Deserialize)]
+struct InstanceQuery {
+    wallet: String,
+}
+
+async fn get_instance_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<InstanceQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let instance = state
+        .manager
+        .list_instances(&q.wallet, None)?
+        .into_iter()
+        .find(|i| i.id == id);
+    match instance {
+        Some(i) => Ok(Json(serde_json::to_value(i)?)),
+        None => Ok(Json(
+            serde_json::json!({ "error": "not found" }),
+        )),
+    }
+}
+
+async fn destroy_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<InstanceQuery>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    // Audit F38: sigauth on destroy. Of all state changes this is the
+    // most consequential — destroy is irreversible. A compromised gateway
+    // could otherwise wipe arbitrary instances by claiming any wallet in
+    // the query string. Permissive rollout still in effect: missing
+    // sigauth warns + accepts; present-but-bad rejects 401.
+    //
+    // The canonical path matches what the gateway forwarder signs (path
+    // without query string), and the body is empty since DELETE carries
+    // no payload.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "DELETE",
+        &format!("/instances/{id}"),
+        &[],
+        &q.wallet,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
+    state.manager.destroy(&id, &q.wallet).await?;
+    Ok(Json(serde_json::json!({ "status": "destroyed", "id": id })).into_response())
+}
+
+async fn instance_health_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    match state.manager.get_health(&id).await? {
+        Some(h) => Ok(Json(serde_json::to_value(h)?)),
+        None => Ok(Json(
+            serde_json::json!({ "error": "not found" }),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct ExtendRequest {
+    wallet: String,
+    duration_secs: i64,
+}
+
+async fn extend_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let req: ExtendRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
+    // Audit F38: sigauth on extend. The wallet bound to the instance
+    // ALSO pays the x402 — so without sigauth a compromised gateway
+    // could repeatedly extend a victim's instance, draining their USDC
+    // 0.05 at a time. Verify the signature is from the instance's
+    // bound wallet before mutating expiry.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{id}/extend"),
+        &body_bytes,
+        &req.wallet,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
+    state
+        .manager
+        .extend_instance(&id, &req.wallet, req.duration_secs)?;
+    Ok(Json(serde_json::json!({ "status": "extended", "id": id })).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// IPFS pinning — real Kubo (go-ipfs)
+// ---------------------------------------------------------------------------
+//
+// Each node runs a sidecar Kubo daemon (typically `ipfs/kubo` in docker)
+// with the API bound to 127.0.0.1:5001 and the gateway on 127.0.0.1:8080.
+// Pin handler POSTs the content as multipart to /api/v0/add?pin=true and
+// returns the real CID; get handler streams from Kubo's gateway.
+//
+// Sidecar metadata: we keep `<data_dir>/ipfs-meta/<cid>.json` (filename +
+// content-type + wallet pubkey) so we can serve content back with the
+// right Content-Type and so an operator can audit who pinned what without
+// querying Kubo.
+
+#[derive(Deserialize)]
+struct IpfsPinRequest {
+    /// Single-file mode: literal content as a string. Required when `files`
+    /// is absent. Use this for inlined SPAs (one HTML file with everything).
+    #[serde(default)]
+    content: Option<String>,
+    /// Multi-file mode: full SPA bundle. Each entry becomes a file under a
+    /// UnixFS directory whose root CID is returned. Required when
+    /// `content` is absent. Use this for SPAs split across index.html +
+    /// assets/* etc. — Kubo's `wrap-with-directory=true` builds the
+    /// directory in one round-trip.
+    #[serde(default)]
+    files: Option<Vec<IpfsPinFile>>,
+    /// Single-file mode only: filename for the upload (defaults to
+    /// "index.html"). Ignored in multi-file mode.
+    #[serde(default)]
+    filename: String,
+    /// Single-file mode only: MIME type. Ignored in multi-file mode (each
+    /// file carries its own).
+    #[serde(rename = "contentType", default)]
+    content_type: String,
+    #[serde(rename = "walletPubkey")]
+    wallet_pubkey: String,
+}
+
+#[derive(Deserialize)]
+struct IpfsPinFile {
+    /// Path inside the UnixFS dir, e.g. "index.html" or "assets/main.js".
+    /// Forward slashes create nested dirs server-side.
+    path: String,
+    /// File contents. Plain UTF-8 by default; set encoding="base64" for
+    /// binary assets (images, fonts, wasm).
+    content: String,
+    /// Optional MIME type. Defaults to "application/octet-stream"; Kubo's
+    /// gateway will sniff from the path extension if absent.
+    #[serde(rename = "contentType", default)]
+    content_type: String,
+    /// "utf8" (default) or "base64". When base64, content is decoded
+    /// before passing to Kubo so the on-IPFS bytes match the original
+    /// binary, not the base64 string.
+    #[serde(default)]
+    encoding: String,
+}
+
+#[derive(serde::Deserialize)]
+struct KuboAddResponse {
+    #[serde(rename = "Hash")]
+    hash: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Size")]
+    #[allow(dead_code)]
+    size: String,
+}
+
+/// Sanitise a single filename component — used for the single-file path's
+/// `filename` field, which doesn't carry directory structure. Multi-file
+/// paths go through `sanitise_path` below which also allows slashes.
+fn sanitise_filename(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .collect()
+}
+
+/// Sanitise a multi-file path. Allows ASCII alnum + dot/dash/underscore +
+/// forward slashes. Strips leading slashes and `..` segments to make path
+/// traversal impossible. Empty result => caller rejects.
+fn sanitise_path(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.' || *c == '/')
+        .collect();
+    cleaned
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+async fn ipfs_pin_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<IpfsPinRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let multi_mode = matches!(&req.files, Some(f) if !f.is_empty());
+    if !multi_mode && req.content.as_deref().unwrap_or("").is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "either `content` (single-file) or `files` (multi-file SPA) is required",
+            })),
+        ));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| AppError(anyhow::anyhow!("reqwest client build: {e}")))?;
+
+    // ── Multi-file SPA path ────────────────────────────────────────────────
+    // Build one multipart Part per file with `wrap-with-directory=true`
+    // so Kubo assembles the UnixFS dir in a single API call. The response
+    // is NDJSON: one line per file plus one for the wrapping dir (with
+    // empty Name). The dir CID is what the agent gets back.
+    if multi_mode {
+        let files = req.files.unwrap();
+        let mut form = reqwest::multipart::Form::new();
+        let mut total_size: usize = 0;
+        let mut manifest: Vec<serde_json::Value> = Vec::with_capacity(files.len());
+        for f in &files {
+            let safe_path = sanitise_path(&f.path);
+            if safe_path.is_empty() {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("invalid path '{}': must contain alphanumerics + . - _ / only", f.path),
+                    })),
+                ));
+            }
+            let bytes: Vec<u8> = match f.encoding.as_str() {
+                "" | "utf8" | "utf-8" => f.content.clone().into_bytes(),
+                "base64" => match {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD.decode(f.content.trim())
+                }
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Ok((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": format!("base64 decode of '{}' failed: {e}", safe_path),
+                            })),
+                        ));
+                    }
+                },
+                other => {
+                    return Ok((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!("unknown encoding '{other}' for path '{}': use 'utf8' or 'base64'", safe_path),
+                        })),
+                    ));
+                }
+            };
+            total_size += bytes.len();
+            let mime = if f.content_type.is_empty() {
+                "application/octet-stream"
+            } else {
+                f.content_type.as_str()
+            };
+            let part = reqwest::multipart::Part::bytes(bytes)
+                .file_name(safe_path.clone())
+                .mime_str(mime)
+                .map_err(|e| AppError(anyhow::anyhow!("invalid Content-Type for '{safe_path}': {e}")))?;
+            form = form.part("file", part);
+            manifest.push(serde_json::json!({
+                "path": safe_path,
+                "contentType": f.content_type,
+            }));
+        }
+
+        let api_url = format!(
+            "{}/api/v0/add?cid-version=1&pin=true&wrap-with-directory=true&progress=false",
+            state.config.kubo_api_url.trim_end_matches('/')
+        );
+
+        let resp = match client.post(&api_url).multipart(form).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, api_url = %api_url, "kubo /api/v0/add (multi) failed");
+                return Ok((
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": format!("kubo unreachable: {e}"),
+                    })),
+                ));
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(status, body = %body, "kubo /api/v0/add (multi) returned non-2xx");
+            return Ok((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("kubo add failed (HTTP {status})"),
+                    "kuboBody": body,
+                })),
+            ));
+        }
+
+        // Parse NDJSON. The wrapping directory is the entry whose Name
+        // matches the empty string OR the longest leading-empty path
+        // (Kubo emits it last). Take the last non-empty line as a
+        // sturdy fallback — older Kubo versions sometimes use Name="."
+        // or the last `/`-prefixed entry to mark the dir.
+        let body_text = resp
+            .text()
+            .await
+            .map_err(|e| AppError(anyhow::anyhow!("reading kubo response: {e}")))?;
+        let entries: Vec<KuboAddResponse> = body_text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        if entries.is_empty() {
+            return Ok((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "kubo returned no entries for multi-file pin",
+                    "kuboBody": body_text,
+                })),
+            ));
+        }
+        // Prefer the entry with empty/blank Name (the wrap-with-dir root).
+        // Fall through to the last entry, which is what Kubo emits when
+        // the wrapping dir is unnamed in newer versions.
+        let dir_entry = entries
+            .iter()
+            .find(|e| e.name.trim().is_empty())
+            .unwrap_or_else(|| entries.last().unwrap());
+        let cid = dir_entry.hash.clone();
+
+        let meta_dir = state.config.data_dir.join("ipfs-meta");
+        tokio::fs::create_dir_all(&meta_dir).await?;
+        let meta = serde_json::json!({
+            "cid": &cid,
+            "kind": "directory",
+            "files": manifest,
+            "walletPubkey": req.wallet_pubkey,
+            "size": total_size,
+        });
+        tokio::fs::write(
+            meta_dir.join(format!("{cid}.json")),
+            serde_json::to_string_pretty(&meta)?,
+        )
+        .await?;
+
+        let gateway_url = format!(
+            "http://{}:{}/ipfs/{}/",
+            state.config.hostname, state.config.api_port, cid
+        );
+
+        info!(
+            cid = %cid,
+            files = files.len(),
+            size = total_size,
+            wallet = %req.wallet_pubkey,
+            "multi-file SPA pinned via kubo"
+        );
+
+        return Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "cid": cid,
+                "gatewayUrl": gateway_url,
+                "publicGatewayUrl": format!("https://ipfs.io/ipfs/{cid}/"),
+                "size": total_size,
+                "fileCount": files.len(),
+            })),
+        ));
+    }
+
+    // ── Single-file path (legacy) ─────────────────────────────────────────
+    let content = req.content.unwrap_or_default();
+    let raw_filename = if req.filename.is_empty() {
+        "index.html".to_string()
+    } else {
+        req.filename.clone()
+    };
+    let safe_filename = sanitise_filename(&raw_filename);
+    if safe_filename.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "filename contains only invalid characters" })),
+        ));
+    }
+
+    // Build a multipart request. Kubo's /api/v0/add expects a "file" part
+    // with the raw bytes. We pass cid-version=1 so we get a modern
+    // self-describing CID (bafy…) instead of legacy QmHash format.
+    let body_bytes = content.into_bytes();
+    let size = body_bytes.len();
+    let part = reqwest::multipart::Part::bytes(body_bytes)
+        .file_name(safe_filename.clone())
+        .mime_str(if req.content_type.is_empty() {
+            "application/octet-stream"
+        } else {
+            req.content_type.as_str()
+        })
+        .map_err(|e| AppError(anyhow::anyhow!("invalid Content-Type: {e}")))?;
+    let form = reqwest::multipart::Form::new().part("file", part);
+
+    let api_url = format!(
+        "{}/api/v0/add?cid-version=1&pin=true&progress=false",
+        state.config.kubo_api_url.trim_end_matches('/')
+    );
+
+    let resp = client.post(&api_url).multipart(form).send().await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, api_url = %api_url, "kubo /api/v0/add failed");
+            return Ok((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("kubo unreachable: {e}"),
+                    "hint": "check that the Kubo daemon is running and SUPABA_KUBO_API_URL is correct",
+                })),
+            ));
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        warn!(status, body = %body, "kubo /api/v0/add returned non-2xx");
+        return Ok((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": format!("kubo add failed (HTTP {status})"),
+                "kuboBody": body,
+            })),
+        ));
+    }
+
+    // Kubo's /api/v0/add returns one JSON object per added file (we sent
+    // one). When `progress=false` we still get a single `{Name,Hash,Size}`
+    // line. Some Kubo versions still emit ND-JSON, so take the last
+    // non-empty line.
+    let body_text = resp
+        .text()
+        .await
+        .map_err(|e| AppError(anyhow::anyhow!("reading kubo response: {e}")))?;
+    let last_line = body_text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    let added: KuboAddResponse = serde_json::from_str(last_line).map_err(|e| {
+        AppError(anyhow::anyhow!(
+            "parsing kubo response (line='{last_line}'): {e}"
+        ))
+    })?;
+
+    let cid = added.hash;
+
+    // Sidecar metadata so /ipfs/:cid can return the right Content-Type.
+    let meta_dir = state.config.data_dir.join("ipfs-meta");
+    tokio::fs::create_dir_all(&meta_dir).await?;
+    let meta = serde_json::json!({
+        "cid": &cid,
+        "filename": &safe_filename,
+        "contentType": req.content_type,
+        "walletPubkey": req.wallet_pubkey,
+        "size": size,
+    });
+    tokio::fs::write(
+        meta_dir.join(format!("{cid}.json")),
+        serde_json::to_string_pretty(&meta)?,
+    )
+    .await?;
+
+    let gateway_url = format!(
+        "http://{}:{}/ipfs/{}",
+        state.config.hostname, state.config.api_port, cid
+    );
+
+    info!(
+        cid = %cid,
+        filename = %safe_filename,
+        size,
+        wallet = %req.wallet_pubkey,
+        "content pinned via kubo"
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "cid": cid,
+            "gatewayUrl": gateway_url,
+            "publicGatewayUrl": format!("https://ipfs.io/ipfs/{cid}"),
+            "size": size,
+        })),
+    ))
+}
+
+async fn build_and_pin_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let req: frontend_build::BuildAndPinRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
+    // Audit F47: sigauth on build_and_pin. A forged build_and_pin lets a
+    // compromised gateway pin ATTACKER's frontend to the victim's
+    // instance — the resulting CID gets added to the redirect allow-list
+    // (via the same path F38 protects) and victim's magic-link emails
+    // redirect into attacker-controlled JS. Indirect credential theft +
+    // arbitrary code execution in the victim's browser session.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{id}/build-and-pin"),
+        &body_bytes,
+        &req.wallet_pubkey,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
+    // Wallet ownership check before doing any docker work — this is a paid
+    // tool on the gateway, but the node still needs to refuse cross-wallet
+    // calls. Mirrors deploy_function_handler / get_function_source_handler.
+    let _instance = match state.manager.get_instance(&id, &req.wallet_pubkey)? {
+        Some(i) => i,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "instance not found or not owned by this wallet",
+                })),
+            )
+                .into_response());
+        }
+    };
+
+    let docker = std::sync::Arc::new(
+        bollard::Docker::connect_with_local_defaults()
+            .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?,
+    );
+
+    match frontend_build::build_and_pin(
+        docker,
+        &state.config.kubo_api_url,
+        &state.config.public_host,
+        state.config.api_port,
+        req,
+    )
+    .await
+    {
+        Ok(r) => Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "cid": r.cid,
+                "url": r.url,
+                "size": r.size_bytes,
+                "fileCount": r.file_count,
+                "durationMs": r.duration_ms,
+                "buildLog": r.build_log,
+                "exitCode": r.exit_code,
+            })),
+        )
+            .into_response()),
+        Err(e) => Ok((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "build_failed",
+                "message": e.to_string(),
+            })),
+        )
+            .into_response()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Database migration handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MigrateProbeRequest {
+    #[serde(rename = "walletPubkey")]
+    wallet_pubkey: String,
+    #[serde(rename = "sourceUrl")]
+    source_url: String,
+}
+
+async fn migrate_probe_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let req: MigrateProbeRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
+    // Audit F46: sigauth on migrate_probe. Even though probe is
+    // read-only, the source_url carries credentials and a forged probe
+    // could be used to test which internal hosts are reachable from
+    // the migration container (same SSRF probe concern as F5 — though
+    // F5 closed that at the gateway, sigauth here defends the node-
+    // side path too).
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{id}/migrate/probe"),
+        &body_bytes,
+        &req.wallet_pubkey,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
+    if state.manager.get_instance(&id, &req.wallet_pubkey)?.is_none() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "instance not found or not owned by this wallet"
+            })),
+        )
+            .into_response());
+    }
+    let docker = std::sync::Arc::new(
+        bollard::Docker::connect_with_local_defaults()
+            .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?,
+    );
+    match db_migration::probe_source(docker, &req.source_url).await {
+        Ok(probe) => Ok((StatusCode::OK, Json(serde_json::to_value(probe)?)).into_response()),
+        Err(e) => Ok((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "source_probe_failed",
+                "message": e.to_string(),
+            })),
+        )
+            .into_response()),
+    }
+}
+
+async fn migrate_start_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let mut req: db_migration::MigrationStartRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
+    // Audit F46: sigauth on migrate_start. A migration container runs
+    // pg_dump | pg_restore from an attacker-controlled source into the
+    // victim's instance — that means a forged migrate_start could
+    // OVERWRITE the victim's tables with arbitrary data sourced from
+    // the attacker's chosen URL. Data-integrity attack via gateway
+    // compromise. Verify the sig is from the instance owner's wallet
+    // before doing any docker work.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{id}/migrate"),
+        &body_bytes,
+        &req.wallet_pubkey,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
+    let inst = match state.manager.get_instance(&id, &req.wallet_pubkey)? {
+        Some(i) => i,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "instance not found or not owned by this wallet"
+                })),
+            )
+                .into_response());
+        }
+    };
+    // Build the target URL server-side. External Postgres port is
+    // postgres_port + 100 (matches render_env_file's pg_external offset).
+    // We use host.docker.internal so the migration container reaches the
+    // host-bound port.
+    let pg_external_port = inst.postgres_port + 100;
+    req.target_url = format!(
+        "postgresql://postgres:{}@host.docker.internal:{}/postgres",
+        urlencoding::encode(&inst.postgres_password),
+        pg_external_port
+    );
+    let docker = std::sync::Arc::new(
+        bollard::Docker::connect_with_local_defaults()
+            .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?,
+    );
+    let mode = req.mode.as_deref().unwrap_or("bulk").to_string();
+    let container_name = format!("kraph-migrate-{}", nanoid::nanoid!(12).to_lowercase());
+    let result = if mode == "live_sync" {
+        // Pubsub name lives for the lifetime of the replication — cutover
+        // tool needs the same name. Encode it into the container name so
+        // the gateway can reconstruct it.
+        let pubsub = format!(
+            "kraph_{}",
+            container_name.trim_start_matches("kraph-migrate-")
+        );
+        db_migration::run_live_sync_setup(docker, &container_name, &pubsub, &req).await
+    } else {
+        db_migration::run_bulk_migration(docker, &container_name, req).await
+    };
+    match result {
+        Ok(r) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "container_name": container_name,
+                "state": r.state,
+                "duration_ms": r.duration_ms,
+                "exit_code_dump": r.exit_code_dump,
+                "exit_code_restore": r.exit_code_restore,
+                "rows_migrated": r.rows_migrated,
+                "tables_done": r.tables_done,
+                "log_tail": r.log_tail,
+                "error": r.error,
+            })),
+        )
+            .into_response()),
+        Err(e) => Ok((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "migration_failed",
+                "message": e.to_string(),
+                "container_name": container_name,
+            })),
+        )
+            .into_response()),
+    }
+}
+
+#[derive(Deserialize)]
+struct MigrateCutoverRequest {
+    #[serde(rename = "walletPubkey")]
+    wallet_pubkey: String,
+    #[serde(rename = "sourceUrl")]
+    source_url: String,
+    #[serde(default, rename = "maxWaitSecs")]
+    max_wait_secs: Option<u64>,
+}
+
+async fn migrate_cutover_handler(
+    State(state): State<Arc<AppState>>,
+    Path((id, pubsub)): Path<(String, String)>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let req: MigrateCutoverRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
+    // Audit F55: sigauth on cutover. Wallet ownership is also checked
+    // below via get_instance, but a forged gateway request could still
+    // race other operations. Cutover drops a PUBLICATION on the source
+    // and SUBSCRIPTION on the target — partially-cut state is hard to
+    // recover from; require the wallet sig.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{id}/migrate/cutover/{pubsub}"),
+        &body_bytes,
+        &req.wallet_pubkey,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
+    let inst = match state.manager.get_instance(&id, &req.wallet_pubkey)? {
+        Some(i) => i,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "instance not found or not owned by this wallet"
+                })),
+            )
+                .into_response());
+        }
+    };
+    let target_url = format!(
+        "postgresql://postgres:{}@host.docker.internal:{}/postgres",
+        urlencoding::encode(&inst.postgres_password),
+        inst.postgres_port + 100
+    );
+    let docker = std::sync::Arc::new(
+        bollard::Docker::connect_with_local_defaults()
+            .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?,
+    );
+    let cutover_container = format!("kraph-cutover-{}", nanoid::nanoid!(8).to_lowercase());
+    match db_migration::run_live_sync_cutover(
+        docker,
+        &cutover_container,
+        &pubsub,
+        &req.source_url,
+        &target_url,
+        req.max_wait_secs.unwrap_or(15 * 60),
+    )
+    .await
+    {
+        Ok(r) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "state": r.state,
+                "duration_ms": r.duration_ms,
+                "log_tail": r.log_tail,
+                "error": r.error,
+            })),
+        )
+            .into_response()),
+        Err(e) => Ok((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "cutover_failed",
+                "message": e.to_string(),
+            })),
+        )
+            .into_response()),
+    }
+}
+
+#[derive(Deserialize)]
+struct MigrateCancelQuery {
+    wallet: String,
+}
+
+async fn migrate_cancel_handler(
+    State(state): State<Arc<AppState>>,
+    Path((id, container)): Path<(String, String)>,
+    Query(q): Query<MigrateCancelQuery>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    // Audit F55: previously this handler had NO wallet check AND NO
+    // restriction on `container` — the comment said "wallet-scoped at the
+    // gateway layer" which is exactly the trust-the-gateway pattern the
+    // F37+ sigauth rollout is designed to defeat. A compromised gateway
+    // (or anyone reaching :3401 directly) could kill ANY docker container
+    // on the node by passing its name through this route — including
+    // victims' postgres/storage/auth containers ('supabase-db-<id>',
+    // 'supabase-auth-<id>', etc.) → cross-instance DoS.
+    //
+    // Two guards now:
+    //   1. The `container` path segment MUST start with `kraph-migrate-`.
+    //      This is the format the migration engine generates; refusing
+    //      anything else prevents the killer from being repurposed to
+    //      stop unrelated containers.
+    //   2. Verify ed25519 sigauth against the wallet that owns the
+    //      instance at this URL's :id. The gateway looks up the
+    //      migration's wallet before sending; we re-check here.
+    if !container.starts_with("kraph-migrate-") {
+        return Ok((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "container_name_not_migration",
+                "hint": "this endpoint only kills containers in the `kraph-migrate-*` namespace",
+            })),
+        )
+            .into_response());
+    }
+    let inst = match state.db.get_instance_by_id(&id)? {
+        Some(i) => i,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "instance not found on this node" })),
+            )
+                .into_response());
+        }
+    };
+    // Also check wallet match — the query carries `wallet=<pubkey>` from
+    // the gateway. Defense-in-depth alongside the sigauth verify below.
+    if q.wallet != inst.wallet_pubkey {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "wallet does not own this instance" })),
+        )
+            .into_response());
+    }
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "DELETE",
+        &format!("/instances/{id}/migrate/{container}"),
+        &[],
+        &inst.wallet_pubkey,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
+    let docker = std::sync::Arc::new(
+        bollard::Docker::connect_with_local_defaults()
+            .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?,
+    );
+    match db_migration::cancel_migration(docker, &container).await {
+        Ok(()) => Ok((StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()),
+        Err(e) => Ok((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "migration_cancel_failed",
+                "message": e.to_string(),
+            })),
+        )
+            .into_response()),
+    }
+}
+
+#[derive(Deserialize)]
+struct AppendRedirectUrlsRequest {
+    #[serde(rename = "walletPubkey")]
+    wallet_pubkey: String,
+    /// Extra URL patterns to allow in the GoTrue redirect allow-list.
+    /// May include `**` glob wildcards (GoTrue supports them in path
+    /// segments). Idempotent — duplicates with the existing list are
+    /// dropped server-side.
+    urls: Vec<String>,
+}
+
+async fn append_redirect_urls_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let req: AppendRedirectUrlsRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
+    // Audit F38: sigauth on redirect-urls append. A compromised gateway
+    // could otherwise add `https://attacker.com/**` to a victim's
+    // GOTRUE_URI_ALLOW_LIST, then trigger magic-link sends whose
+    // emailRedirectTo points at attacker.com — capturing JWT tokens via
+    // the OAuth-style fragment. Sigauth pins the request to the wallet.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{id}/auth/redirect-urls"),
+        &body_bytes,
+        &req.wallet_pubkey,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
+    match state
+        .manager
+        .append_redirect_urls(&id, &req.wallet_pubkey, &req.urls)
+        .await
+    {
+        Ok(allow_list) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "redirect_allow_list": allow_list,
+            })),
+        )
+            .into_response()),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("not found") || msg.contains("not owned") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Ok((
+                status,
+                Json(serde_json::json!({
+                    "error": "redirect_url_update_failed",
+                    "message": msg,
+                })),
+            )
+                .into_response())
+        }
+    }
+}
+
+async fn ipfs_get_handler(
+    State(state): State<Arc<AppState>>,
+    Path(cid): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    // Sanitize CID. Real CIDs are alphanumeric (b58 / b32) — strip
+    // anything else as a defence against path injection into the URL we
+    // build for Kubo's gateway.
+    let safe_cid: String = cid
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+    if safe_cid.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid CID" })),
+        )
+            .into_response());
+    }
+
+    // Look up sidecar metadata for content-type. If missing, we still
+    // serve the content but fall back to octet-stream — Kubo's gateway
+    // typically figures it out via UnixFS metadata, but this lets us
+    // override and matches what the pin handler recorded.
+    let meta_path = state
+        .config
+        .data_dir
+        .join("ipfs-meta")
+        .join(format!("{safe_cid}.json"));
+    let content_type = if meta_path.exists() {
+        let meta_bytes = tokio::fs::read(&meta_path).await.unwrap_or_default();
+        serde_json::from_slice::<serde_json::Value>(&meta_bytes)
+            .ok()
+            .and_then(|v| v.get("contentType").and_then(|c| c.as_str()).map(String::from))
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    // Stream from the local Kubo gateway. We could 302 redirect to a
+    // public gateway instead, but proxying keeps the URL stable for
+    // agents and lets us inject the recorded Content-Type.
+    let gateway = state.config.kubo_gateway_url.trim_end_matches('/');
+    let upstream = format!("{gateway}/ipfs/{safe_cid}");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| AppError(anyhow::anyhow!("reqwest build: {e}")))?;
+
+    let resp = match client.get(&upstream).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, upstream = %upstream, "kubo gateway unreachable");
+            return Ok((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("kubo gateway unreachable: {e}"),
+                    "publicGatewayUrl": format!("https://ipfs.io/ipfs/{safe_cid}"),
+                })),
+            )
+                .into_response());
+        }
+    };
+
+    let status = resp.status();
+    let upstream_ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| AppError(anyhow::anyhow!("kubo gateway body read: {e}")))?;
+
+    if !status.is_success() {
+        return Ok((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(serde_json::json!({
+                "error": "content not available from local kubo",
+                "publicGatewayUrl": format!("https://ipfs.io/ipfs/{safe_cid}"),
+            })),
+        )
+            .into_response());
+    }
+
+    // Sidecar Content-Type wins; fall back to upstream's; finally octet.
+    let final_ct = content_type
+        .or(upstream_ct)
+        .unwrap_or_else(|| "application/octet-stream".into());
+
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, final_ct)],
+        bytes.to_vec(),
+    )
+        .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Integrity / Merkle root
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct IntegrityQuery {
+    wallet: Option<String>,
+}
+
+async fn integrity_root_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(_q): Query<IntegrityQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    // Find the instance
+    let instances = state.manager.list_all_instances()?;
+    let instance = instances.into_iter().find(|i| i.id == id);
+    let instance = match instance {
+        Some(i) => i,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "instance not found" })),
+            )
+                .into_response());
+        }
+    };
+
+    // Audit F52 fix: previously the query operated on `(SELECT 1 AS _) t`
+    // — a literal one-row table — so the "Merkle root" was always the
+    // same constant regardless of actual DB state. Agents got false
+    // "verified: true" responses from kraph_verify_integrity.
+    //
+    // Now: walk every public-schema table, hash each row via md5, sort
+    // and aggregate within a table, then aggregate across tables. The
+    // %I format token is Postgres's identifier-safe quoting (handles
+    // tables with reserved words / unusual names) — there is no SQL
+    // injection surface even though tablename comes from pg_tables.
+    //
+    // The function-level SHA-256 hash of the aggregate gives us a
+    // deterministic 32-byte root. Empty schema returns sha256("").
+    //
+    // Limitations of this still-simple digest:
+    //   - It's a flat hash over sorted-row md5s, not a real Merkle tree
+    //     (no inclusion proofs possible). Adding real Merkle proofs
+    //     requires the dead IntegrityManager path to be revived
+    //     (F51) with parameterised queries.
+    //   - System-column ordering of `t.*::text` is stable within a
+    //     postgres version but could shift across major upgrades. The
+    //     hash will change after an upgrade even if logical state is
+    //     unchanged. Acceptable for v1 attestation; document for v2.
+    let container = format!("{}-db-1", instance.compose_project_name);
+    let query = r#"
+        DO $$
+        DECLARE tbl RECORD;
+        BEGIN
+            CREATE TEMP TABLE IF NOT EXISTS _kraph_row_hashes (h TEXT) ON COMMIT DROP;
+            FOR tbl IN
+                SELECT tablename FROM pg_tables
+                WHERE schemaname = 'public'
+                ORDER BY tablename
+            LOOP
+                EXECUTE format(
+                    'INSERT INTO _kraph_row_hashes SELECT md5(t::text) FROM %I t',
+                    tbl.tablename
+                );
+            END LOOP;
+        END $$;
+        SELECT coalesce(string_agg(h, '' ORDER BY h), '') FROM _kraph_row_hashes;
+    "#;
+
+    let out = tokio::process::Command::new("docker")
+        .args(["exec", &container, "psql", "-U", "postgres", "-t", "-A", "-c", query])
+        .output()
+        .await;
+
+    let root = match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                hex::encode(sha2::Sha256::digest(b""))
+            } else {
+                hex::encode(sha2::Sha256::digest(s.as_bytes()))
+            }
+        }
+        Ok(o) => {
+            let stderr_tail = String::from_utf8_lossy(&o.stderr);
+            tracing::error!(
+                instance_id = %id,
+                status = %o.status,
+                stderr = %stderr_tail.chars().take(400).collect::<String>(),
+                "merkle root query failed"
+            );
+            hex::encode(sha2::Sha256::digest(b""))
+        }
+        Err(e) => {
+            tracing::error!(instance_id = %id, error = %e, "merkle root docker exec failed");
+            hex::encode(sha2::Sha256::digest(b""))
+        }
+    };
+
+    Ok(Json(serde_json::json!({
+        "instance_id": id,
+        "merkle_root": root,
+        "computed_at": chrono::Utc::now().to_rfc3339(),
+    }))
+        .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// TEE attestation
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct AttestRequest {
+    nonce: String,
+    #[serde(default)]
+    report_data: Option<String>,
+}
+
+async fn attest_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<AttestRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    use crate::tee::{TeeManager, TeeBackend};
+
+    let tee = TeeManager::new(&state.config);
+    let report_data_str = req.report_data.as_deref().or(Some(id.as_str()));
+
+    let report = match tee.generate_report(&req.nonce, report_data_str).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "valid": false,
+                    "error": format!("attestation failed: {e}"),
+                })),
+            )
+                .into_response());
+        }
+    };
+
+    let verification = tee.verify_report(&report, &req.nonce).await;
+
+    let platform_str = match report.platform {
+        TeeBackend::SevSnp => "sev-snp",
+        TeeBackend::Tdx => "tdx",
+        TeeBackend::Mock => "mock",
+        TeeBackend::None => "none",
+    };
+
+    Ok(Json(serde_json::json!({
+        "valid": verification.valid,
+        "platform": platform_str,
+        "measurement": verification.measurement,
+        "measurement_match": verification.measurement_match,
+        "certificate_chain_valid": verification.certificate_chain_valid,
+        "nonce_match": verification.nonce_match,
+        "error": verification.error,
+        "raw_report": base64_encode(&report.raw_report),
+        "certificate_chain": report.certificate_chain,
+    }))
+        .into_response())
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Edge Functions
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct DeployFunctionRequest {
+    #[serde(alias = "walletPubkey")]
+    wallet_pubkey: String,
+    #[serde(alias = "functionName")]
+    function_name: String,
+    code: String,
+    #[serde(default, alias = "codeHash")]
+    code_hash: Option<String>,
+}
+
+async fn deploy_function_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    // Parse the body manually so we can also hand it to verify_request_sig.
+    let req: DeployFunctionRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
+
+    let instance = match state.manager.get_instance(&id, &req.wallet_pubkey)? {
+        Some(i) => i,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "instance not found" })),
+            )
+                .into_response());
+        }
+    };
+
+    // Mitigation #1 (audit F37 — was F34 in dead code at api/mod.rs).
+    // Verify per-call ed25519 signature from the instance owner's wallet
+    // over the canonical request message. Rollout mode: missing sigauth
+    // is accepted with a warning log; present-but-bad is rejected 401.
+    // Nonce uniqueness (F34) closes the ±5-min replay window.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{id}/functions/deploy"),
+        &body_bytes,
+        &instance.wallet_pubkey,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
+
+    // Verify code hash
+    use sha2::Digest;
+    let computed_hash = hex::encode(sha2::Sha256::digest(req.code.as_bytes()));
+    if let Some(expected) = &req.code_hash {
+        if *expected != computed_hash {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "code hash mismatch" })),
+            )
+                .into_response());
+        }
+    }
+
+    // Sanitize function name
+    let fname: String = req
+        .function_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if fname.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid function name" })),
+        )
+            .into_response());
+    }
+
+    // Write function code to the instance's functions volume
+    let instance_dir = std::path::PathBuf::from(&instance.instance_dir);
+    let func_dir = instance_dir.join("volumes").join("functions").join(&fname);
+    tokio::fs::create_dir_all(&func_dir).await?;
+    tokio::fs::write(func_dir.join("index.ts"), &req.code).await?;
+
+    let invoke_url = format!("{}/functions/v1/{}", instance.url, fname);
+
+    Ok(Json(serde_json::json!({
+        "status": "deployed",
+        "function_name": fname,
+        "code_hash": computed_hash,
+        "invoke_url": invoke_url,
+    }))
+        .into_response())
+}
+
+async fn list_functions_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<IntegrityQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let wallet = q.wallet.unwrap_or_default();
+    let instance = match state.manager.get_instance(&id, &wallet)? {
+        Some(i) => i,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "instance not found" })),
+            )
+                .into_response());
+        }
+    };
+
+    let instance_dir = std::path::PathBuf::from(&instance.instance_dir);
+    let func_dir = instance_dir.join("volumes").join("functions");
+
+    let mut functions = Vec::new();
+    if func_dir.exists() {
+        let mut entries = tokio::fs::read_dir(&func_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "main" || name.starts_with('.') {
+                continue;
+            }
+            let code_path = func_dir.join(&name).join("index.ts");
+            let code_hash = if code_path.exists() {
+                let code = tokio::fs::read(&code_path).await.unwrap_or_default();
+                use sha2::Digest;
+                hex::encode(sha2::Sha256::digest(&code))
+            } else {
+                "unknown".to_string()
+            };
+            functions.push(serde_json::json!({
+                "name": name,
+                "code_hash": code_hash,
+            }));
+        }
+    }
+
+    Ok(Json(serde_json::json!({ "functions": functions })).into_response())
+}
+
+/// `GET /instances/:id/functions/:name/source` — return the deployed
+/// function's source code verbatim.
+///
+/// Reads from `<instance_dir>/volumes/functions/<name>/index.{ts,js}` —
+/// the same on-host path the deploy handler writes to. The file IS the
+/// agent's source as-typed (Deno compiles TS→JS JIT at request time
+/// inside the container; we don't run a build step).
+async fn get_function_source_handler(
+    State(state): State<Arc<AppState>>,
+    Path((id, name)): Path<(String, String)>,
+    Query(q): Query<IntegrityQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let wallet = q.wallet.unwrap_or_default();
+    let instance = match state.manager.get_instance(&id, &wallet)? {
+        Some(i) => i,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "instance not found" })),
+            )
+                .into_response());
+        }
+    };
+
+    // Sanitise name the same way deploy_function does — alphanumerics,
+    // dash, underscore. Path traversal is impossible because we never
+    // join arbitrary input into the path; the regex enforces it.
+    let safe_name: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if safe_name.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid function name" })),
+        )
+            .into_response());
+    }
+
+    let func_dir = std::path::PathBuf::from(&instance.instance_dir)
+        .join("volumes")
+        .join("functions")
+        .join(&safe_name);
+    if !func_dir.exists() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("function '{}' not found", safe_name),
+            })),
+        )
+            .into_response());
+    }
+
+    // Probe .ts first then .js (deploy_function picks based on `language`).
+    let ts_path = func_dir.join("index.ts");
+    let js_path = func_dir.join("index.js");
+    let (path, language) = if ts_path.exists() {
+        (ts_path, "typescript")
+    } else if js_path.exists() {
+        (js_path, "javascript")
+    } else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("function '{}' has no index.ts or index.js", safe_name),
+            })),
+        )
+            .into_response());
+    };
+
+    let code = match tokio::fs::read_to_string(&path).await {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to read source: {e}"),
+                })),
+            )
+                .into_response());
+        }
+    };
+
+    use sha2::Digest;
+    let code_hash = hex::encode(sha2::Sha256::digest(code.as_bytes()));
+    let updated_at = match tokio::fs::metadata(&path).await {
+        Ok(meta) => meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64),
+        Err(_) => None,
+    };
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "name": safe_name,
+            "language": language,
+            "code": code,
+            "code_hash": code_hash,
+            "size_bytes": code.len(),
+            "updated_at_unix": updated_at,
+        })),
+    )
+        .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Per-instance edge-function env vars
+// ---------------------------------------------------------------------------
+//
+// Design notes (Path A from the env-vars spec): we persist `(instance_id,
+// key, value)` tuples in SQLite, and on every mutation we rewrite
+// `{instance_dir}/volumes/functions/.env` and force-recreate ONLY the
+// functions container (`docker compose up -d --force-recreate --no-deps
+// functions`). Postgres and the rest of the stack are untouched. The
+// rewrite + recreate is fired off in a tokio task so the HTTP handler
+// returns in <10ms; the agent can poll `GET /env` to confirm.
+
+/// Extract the `X-Wallet-Pubkey` header or return a 401.
+fn extract_wallet_header(
+    headers: &axum::http::HeaderMap,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    headers
+        .get("X-Wallet-Pubkey")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "missing or invalid X-Wallet-Pubkey header"
+                })),
+            )
+        })
+}
+
+/// Fetch the instance and verify the caller owns it. Returns the `Instance`
+/// on success, or a ready-to-return HTTP error tuple on failure.
+fn require_owned_instance(
+    state: &AppState,
+    id: &str,
+    wallet: &str,
+) -> Result<db::Instance, (StatusCode, Json<serde_json::Value>)> {
+    let instance = match state.db.get_instance_by_id(id) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "instance not found" })),
+            ));
+        }
+        Err(e) => {
+            error!(error = %e, instance_id = %id, "db error looking up instance");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal error" })),
+            ));
+        }
+    };
+
+    if instance.wallet_pubkey != wallet {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "wallet does not own this instance"
+            })),
+        ));
+    }
+    Ok(instance)
+}
+
+/// Validate that the env-var key is a sane shell identifier. We're writing
+/// it into a `.env` file that docker-compose parses, so keep the rules
+/// narrow: `[A-Za-z_][A-Za-z0-9_]*`, 1..=128 chars.
+fn validate_env_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("key is empty".into());
+    }
+    if key.len() > 128 {
+        return Err("key exceeds 128 chars".into());
+    }
+    let mut chars = key.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Err("key must start with a letter or underscore".into());
+    }
+    for c in chars {
+        if !(c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!("key contains invalid character '{c}'"));
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct SetEnvRequest {
+    key: String,
+    value: String,
+    /// When `true`, the value is hidden from `GET /env` responses (only
+    /// keys + protected flag are returned). Used for user-paste-in
+    /// secrets that the agent must not be able to read back. Defaults
+    /// to `false` for backward compat with the agent-set path.
+    #[serde(default)]
+    protected: bool,
+}
+
+/// `POST /instances/:id/env` — upsert a single env var.
+///
+/// Body: `{ "key": "OPENAI_API_KEY", "value": "sk-..." }`.
+/// Requires `X-Wallet-Pubkey` header; caller must own the instance.
+/// Returns `200 {"ok": true, "key": "...", "applied": true}` and kicks off
+/// an async functions-container recreate.
+async fn set_env_handler(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body_bytes: axum::body::Bytes,
+) -> impl IntoResponse {
+    let wallet = match extract_wallet_header(&headers) {
+        Ok(w) => w,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_owned_instance(&state, &id, &wallet) {
+        return e.into_response();
+    }
+
+    // Mitigation #1 (audit F37): verify per-call sigauth from the instance
+    // owner's wallet. set_env writes potentially-sensitive values (API
+    // keys etc.) to the functions container — sigauth ensures the request
+    // really came from the wallet, not a forged gateway claim.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{id}/env"),
+        &body_bytes,
+        &wallet,
+    ) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+
+    let req: SetEnvRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid JSON body: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(msg) = validate_env_key(&req.key) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid key: {msg}") })),
+        )
+            .into_response();
+    }
+    // Reasonable upper bound so an agent cannot exhaust disk with a single
+    // multi-MB value. 1 MiB is far above any sane API key / config blob.
+    if req.value.len() > 1_048_576 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "value exceeds 1 MiB" })),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = state
+        .db
+        .upsert_env_with_protection(&id, &req.key, &req.value, req.protected)
+    {
+        let msg = format!("{e}");
+        // The "key reserved as user-set secret" guard is a precise 409
+        // (conflict), not a 500 — the gateway maps this to a friendly
+        // error the agent can act on by picking a different name.
+        if msg.contains("reserved as a user-set secret") {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": msg,
+                    "error_code": "key_reserved_protected",
+                })),
+            )
+                .into_response();
+        }
+        error!(error = %e, instance_id = %id, "upsert_env failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "failed to persist env var" })),
+        )
+            .into_response();
+    }
+
+    // Rewrite .env + recreate the functions container. apply_env_to_functions
+    // spawns the docker work itself; the file rewrite is sync.
+    if let Err(e) = state.manager.apply_env_to_functions(&id).await {
+        // Log but don't fail the request — the DB is already updated. The
+        // agent can call /env/apply to retry the file+restart step.
+        warn!(
+            error = %e,
+            instance_id = %id,
+            "apply_env_to_functions failed after upsert; DB is authoritative"
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "key": req.key,
+                "applied": false,
+                "warning": format!("persisted but apply failed: {e}"),
+            })),
+        )
+            .into_response();
+    }
+
+    info!(instance_id = %id, key = %req.key, "env var set");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "key": req.key,
+            "applied": true,
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /instances/:id/env` — list env vars.
+///
+/// Query params:
+///   - `include_protected=true|false` (default `false`): when false, rows
+///     where `protected=true` are returned with `value=null`. The agent's
+///     kraph_list_env path goes through the gateway with the default
+///     (false) so user-paste-in secrets stay opaque to the agent.
+///     The dashboard-api's secrets-listing endpoint passes
+///     `include_protected=true` so the human owner can audit their
+///     own secrets in the Forge UI. Wallet-owner check still applies
+///     either way; this is a defence-in-depth filter, not the only
+///     boundary.
+async fn list_env_handler(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let wallet = match extract_wallet_header(&headers) {
+        Ok(w) => w,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_owned_instance(&state, &id, &wallet) {
+        return e.into_response();
+    }
+
+    let include_protected = q
+        .get("include_protected")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    match state.db.list_env_full_with_protection(&id) {
+        Ok(rows) => {
+            let env: Vec<_> = rows
+                .into_iter()
+                .map(|(k, v, prot, ts)| {
+                    if prot && !include_protected {
+                        // Hide the value; surface that it exists and is
+                        // protected so the agent can REFERENCE the key
+                        // by name in code without ever seeing plaintext.
+                        serde_json::json!({
+                            "key": k,
+                            "value": serde_json::Value::Null,
+                            "protected": true,
+                            "updated_at": ts,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "key": k,
+                            "value": v,
+                            "protected": prot,
+                            "updated_at": ts,
+                        })
+                    }
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::json!({ "env": env }))).into_response()
+        }
+        Err(e) => {
+            error!(error = %e, instance_id = %id, "list_env_full failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "failed to list env" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /instances/:id/env/keys` — list just the env-var keys.
+async fn list_env_keys_handler(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let wallet = match extract_wallet_header(&headers) {
+        Ok(w) => w,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_owned_instance(&state, &id, &wallet) {
+        return e.into_response();
+    }
+
+    match state.db.get_env_keys(&id) {
+        Ok(keys) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "keys": keys })),
+        )
+            .into_response(),
+        Err(e) => {
+            error!(error = %e, instance_id = %id, "get_env_keys failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "failed to list env keys" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `DELETE /instances/:id/env/:key` — delete one env var.
+async fn delete_env_handler(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path((id, key)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let wallet = match extract_wallet_header(&headers) {
+        Ok(w) => w,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_owned_instance(&state, &id, &wallet) {
+        return e.into_response();
+    }
+
+    // Audit F39 (sigauth rollout continued): verify per-call signature
+    // on env deletes too. DELETE has no body so we sign against
+    // sha256("") = e3b0c4... Same permissive-rollout semantics.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "DELETE",
+        &format!("/instances/{id}/env/{key}"),
+        &[],
+        &wallet,
+    ) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+
+    if let Err(msg) = validate_env_key(&key) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid key: {msg}") })),
+        )
+            .into_response();
+    }
+
+    let deleted = match state.db.delete_env(&id, &key) {
+        Ok(d) => d,
+        Err(e) => {
+            error!(error = %e, instance_id = %id, %key, "delete_env failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "failed to delete env var" })),
+            )
+                .into_response();
+        }
+    };
+
+    if !deleted {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "key not found" })),
+        )
+            .into_response();
+    }
+
+    // Rewrite and recreate.
+    if let Err(e) = state.manager.apply_env_to_functions(&id).await {
+        warn!(
+            error = %e,
+            instance_id = %id,
+            "apply_env_to_functions failed after delete; DB is authoritative"
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "key": key,
+                "applied": false,
+                "warning": format!("deleted but apply failed: {e}"),
+            })),
+        )
+            .into_response();
+    }
+
+    info!(instance_id = %id, %key, "env var deleted");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "key": key,
+            "applied": true,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /instances/:id/env/apply` — force a rewrite of the functions
+/// `.env` file and recreate the functions container. Useful after an
+/// out-of-band DB edit or to retry a failed apply.
+async fn apply_env_handler(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let wallet = match extract_wallet_header(&headers) {
+        Ok(w) => w,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_owned_instance(&state, &id, &wallet) {
+        return e.into_response();
+    }
+
+    match state.manager.apply_env_to_functions(&id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "applied": true,
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            error!(error = %e, instance_id = %id, "apply_env_to_functions failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("apply failed: {e}"),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Studio auth gate (Phase 3, subdomain mode)
+// ---------------------------------------------------------------------------
+//
+// Two HTTP routes, both mounted on the wildcard subdomain `*.studio.<apex>`
+// behind Caddy:
+//
+//   GET /__kraph/studio/exchange?token=<minted-by-gateway>
+//     - Verifies the gateway-minted HMAC token.
+//     - Sets a Domain=.studio.<apex> cookie (HttpOnly, Secure, SameSite=Lax).
+//     - 302s the browser to `/` of the same subdomain (Studio's home).
+//
+//   GET /__kraph/studio/forward-auth   (called by Caddy's `forward_auth`)
+//     - Reads the cookie, verifies HMAC, checks claims.i == <id> from Host.
+//     - On success: 200 + X-Kraph-Studio-Port: <port>  (Caddy proxies there).
+//     - On the *exchange URL itself* (which carries a fresh `token` query
+//       param but no cookie yet): also 200, so Caddy hands the request to
+//       the exchange handler which sets the cookie.
+
+#[derive(serde::Deserialize)]
+struct StudioExchangeQuery {
+    token: String,
+}
+
+async fn studio_exchange_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<StudioExchangeQuery>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let secret = &state.config.studio_proxy_secret;
+    if secret.is_empty() {
+        warn!("/__kraph/studio/exchange called but SUPABA_STUDIO_PROXY_SECRET is unset");
+        return (
+            StatusCode::FORBIDDEN,
+            "studio proxy not configured on this node",
+        )
+            .into_response();
+    }
+    let apex = state.config.studio_apex.trim_start_matches('.');
+    if apex.is_empty() {
+        return (
+            StatusCode::FORBIDDEN,
+            "studio proxy apex not configured (SUPABA_STUDIO_APEX)",
+        )
+            .into_response();
+    }
+
+    let claims = match studio_proxy::verify_token(secret, &q.token) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "studio token rejected at exchange");
+            return (
+                StatusCode::FORBIDDEN,
+                format!("invalid studio token: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    // Confirm the instance still exists on this node before handing out a
+    // cookie. Avoids minting a session that 404s on the very next click.
+    match state.db.get_instance_by_id(&claims.i) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, "instance not found on this node")
+                .into_response();
+        }
+        Err(e) => {
+            error!(error = %e, "db lookup failed during studio exchange");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    }
+
+    // The Host the browser used (Caddy passes it through). We need it to
+    // confirm the URL the user actually loaded matches the token's instance
+    // — otherwise a wallet that owns instance A could craft a link that
+    // sets the cookie on subdomain B. Defence-in-depth: claims.i is also
+    // the basis for the forward-auth host check below.
+    //
+    // Audit F49: previously this check was nested `if let Some(...)` which
+    // fell through (no error) when the Host header was missing or had no
+    // dot. Cookie would still get set in that case. Fail-CLOSED instead:
+    // a missing/malformed host on the exchange path is itself a 403.
+    // forward_auth_handler already fails closed (cookie won't validate on
+    // any later request), so this is mostly defence in depth + clearer
+    // user-visible error rather than confusing silent cookie-set.
+    let host = match headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+    {
+        Some(h) => h,
+        None => {
+            return (StatusCode::FORBIDDEN, "Host header required").into_response();
+        }
+    };
+    let host_id = match studio_proxy::instance_id_from_host(host) {
+        Some(id) => id,
+        None => {
+            return (StatusCode::FORBIDDEN, "malformed Host header").into_response();
+        }
+    };
+    if host_id != claims.i {
+        return (
+            StatusCode::FORBIDDEN,
+            format!(
+                "exchange URL host ({host}) does not match token instance ({})",
+                claims.i
+            ),
+        )
+            .into_response();
+    }
+
+    let cookie = studio_proxy::build_cookie(&q.token, apex, studio_proxy::DEFAULT_TTL_SECS);
+
+    info!(
+        instance_id = %claims.i,
+        wallet = %claims.w,
+        "studio exchange ok — minting cookie",
+    );
+
+    axum::response::Response::builder()
+        .status(StatusCode::FOUND)
+        .header(axum::http::header::LOCATION, "/")
+        .header(axum::http::header::SET_COOKIE, cookie)
+        .body(axum::body::Body::empty())
+        .expect("static response builds")
+}
+
+/// `GET /__kraph/studio/forward-auth` — invoked by Caddy on every Studio
+/// request before forwarding upstream. Returns:
+///   - 200 + X-Kraph-Studio-Port: <port>   when cookie is valid for this host
+///   - 200 (unauthenticated, but allowed)  when the request is to the
+///     `/__kraph/studio/exchange` URL itself (carries a token query string;
+///     the exchange handler will validate the token and set the cookie)
+///   - 401                                 otherwise
+async fn studio_forward_auth_handler(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    // Caddy passes the original request URI in X-Forwarded-Uri so we can
+    // detect the "user is mid-exchange, no cookie yet" case.
+    let forwarded_uri = headers
+        .get("x-forwarded-uri")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if forwarded_uri.starts_with("/__kraph/studio/exchange") {
+        // Let the request through; the exchange handler authenticates via
+        // the token query string.
+        return (StatusCode::OK, "").into_response();
+    }
+
+    let secret = &state.config.studio_proxy_secret;
+    if secret.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "studio proxy not configured")
+            .into_response();
+    }
+
+    let cookie = match studio_proxy::read_studio_cookie(&headers) {
+        Some(c) => c,
+        None => return (StatusCode::UNAUTHORIZED, "missing cookie").into_response(),
+    };
+    let claims = match studio_proxy::verify_token(secret, &cookie) {
+        Ok(c) => c,
+        Err(e) => {
+            return (StatusCode::UNAUTHORIZED, format!("invalid cookie: {e}"))
+                .into_response();
+        }
+    };
+
+    // Bind the cookie to the host the browser used. Without this, a cookie
+    // for instance A is good for instance B's subdomain too (since Domain
+    // is wildcard).
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(axum::http::header::HOST))
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    let host_id = studio_proxy::instance_id_from_host(host).unwrap_or("");
+    if host_id != claims.i {
+        return (
+            StatusCode::UNAUTHORIZED,
+            format!("cookie issued for {}, host says {host_id}", claims.i),
+        )
+            .into_response();
+    }
+
+    let instance = match state.db.get_instance_by_id(&claims.i) {
+        Ok(Some(i)) => i,
+        Ok(None) => return (StatusCode::NOT_FOUND, "instance not found").into_response(),
+        Err(e) => {
+            error!(error = %e, "db lookup failed in forward-auth");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+        }
+    };
+
+    // Tell Caddy where to proxy. It picks this up via `copy_headers` in
+    // the forward_auth block, then plugs it into reverse_proxy.
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("X-Kraph-Studio-Port", instance.studio_port.to_string())
+        .body(axum::body::Body::empty())
+        .expect("static response builds")
+}
+
+// ---------------------------------------------------------------------------
+// Error handling
+// ---------------------------------------------------------------------------
+
+struct AppError(anyhow::Error);
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> axum::response::Response {
+        error!(error = %self.0, "request error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": self.0.to_string() })),
+        )
+            .into_response()
+    }
+}
+
+impl<E: Into<anyhow::Error>> From<E> for AppError {
+    fn from(err: E) -> Self {
+        Self(err.into())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Replication handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AddReplicaRequest {
+    /// Full URL of the replica node, e.g. "http://10.0.0.5:3401".
+    /// Trailing slash is tolerated.
+    endpoint: String,
+}
+
+async fn add_replica_handler(
+    State(state): State<Arc<AppState>>,
+    Path(instance_id): Path<String>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let req: AddReplicaRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| AppError(anyhow::anyhow!("invalid JSON body: {e}")))?;
+    let endpoint = req.endpoint.trim().trim_end_matches('/').to_string();
+    if endpoint.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "endpoint is required" })),
+        )
+            .into_response());
+    }
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "endpoint must start with http(s)://" })),
+        )
+            .into_response());
+    }
+
+    // Audit F47: previously this endpoint accepted ANY caller with no
+    // wallet or signature check at all — the node would happily add a
+    // replica to any existing instance for anyone who could reach
+    // :3401/instances/:id/replicas. A network attacker could add
+    // arbitrary replica endpoints (the primary ships encrypted WAL to
+    // each — opaque ciphertext, but a DoS via bandwidth AND a future
+    // exfil path if the DEK envelope is ever weakened). Now: look up
+    // the instance's bound wallet and require a sig from that wallet.
+    let inst = match state.db.get_instance_by_id(&instance_id)? {
+        Some(i) => i,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "instance not found on this node" })),
+            )
+                .into_response());
+        }
+    };
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{instance_id}/replicas"),
+        &body_bytes,
+        &inst.wallet_pubkey,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
+
+    let added = state.db.add_instance_replica(&instance_id, &endpoint)?;
+    info!(instance_id = %instance_id, endpoint = %endpoint, added, "replica registered");
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "instance_id": instance_id,
+            "endpoint": endpoint,
+            "added": added,
+        })),
+    )
+        .into_response())
+}
+
+async fn list_replicas_handler(
+    State(state): State<Arc<AppState>>,
+    Path(instance_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let replicas = state.db.list_instance_replicas(&instance_id)?;
+    Ok(Json(serde_json::json!({
+        "instance_id": instance_id,
+        "replicas": replicas,
+    })))
+}
+
+async fn force_switch_wal_handler(
+    State(state): State<Arc<AppState>>,
+    Path(instance_id): Path<String>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    // Audit F48: prior version had NO wallet check at all — anyone reaching
+    // :3401/instances/:id/replicas/force-switch-wal could repeatedly
+    // trigger pg_switch_wal() and spawn fresh WAL segments. Each new
+    // segment ships to all replicas (bandwidth + disk DoS).
+    //
+    // Look up the instance's bound wallet, then verify the signature is
+    // from that wallet. Same pattern as add_replica_handler.
+    let inst = match state.db.get_instance_by_id(&instance_id)? {
+        Some(i) => i,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "instance not found on this node" })),
+            )
+                .into_response());
+        }
+    };
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{instance_id}/replicas/force-switch-wal"),
+        &body_bytes,
+        &inst.wallet_pubkey,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
+    let segment = state.replication.switch_wal(&instance_id).await?;
+    Ok(Json(serde_json::json!({
+        "instance_id": instance_id,
+        "rotated_segment": segment,
+    }))
+    .into_response())
+}
+
+/// `POST /replication/receive` — replica-side ingest endpoint.
+///
+/// Body: raw bytes of the encrypted segment (nonce || ciphertext || tag).
+/// Headers:
+///   - X-Instance-Id
+///   - X-Segment-Name
+///   - X-Segment-Hash       (sha256(prev_hash || body), hex)
+///   - X-Previous-Hash      (hex, may be empty for the first segment)
+///   - X-Chain-Index        (decimal i64)
+async fn receive_replication_handler(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    fn h<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Result<&'a str, AppError> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                AppError(anyhow::anyhow!("missing or invalid header {name}"))
+            })
+    }
+
+    let instance_id = h(&headers, "X-Instance-Id")?.to_string();
+    let segment_name = h(&headers, "X-Segment-Name")?.to_string();
+    let segment_hash = h(&headers, "X-Segment-Hash")?.to_string();
+    let previous_hash = headers
+        .get("X-Previous-Hash")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let chain_index: i64 = h(&headers, "X-Chain-Index")?
+        .parse()
+        .map_err(|e| AppError(anyhow::anyhow!("invalid X-Chain-Index: {e}")))?;
+    let replication_sig = headers
+        .get("X-Replication-Sig")
+        .and_then(|v| v.to_str().ok());
+
+    let row = state
+        .replication
+        .receive_segment(
+            &instance_id,
+            &segment_name,
+            &segment_hash,
+            &previous_hash,
+            chain_index,
+            replication_sig,
+            &body,
+        )
+        .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "status": "received",
+            "instance_id": row.instance_id,
+            "segment_name": row.segment_name,
+            "chain_index": row.chain_index,
+            "size": row.size,
+            "stored_path": row.stored_path,
+        })),
+    ))
+}
+
+async fn list_replica_segments_handler(
+    State(state): State<Arc<AppState>>,
+    Path(instance_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let segments = state.replication.list_replica_segments(&instance_id).await?;
+    Ok(Json(serde_json::json!({
+        "instance_id": instance_id,
+        "segment_count": segments.len(),
+        "segments": segments,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Background tasks
+// ---------------------------------------------------------------------------
+
+fn spawn_background_tasks(state: Arc<AppState>, config: &Config) {
+    let cleanup_interval = Duration::from_secs(config.cleanup_interval_secs);
+    let heartbeat_interval = Duration::from_secs(config.heartbeat_interval_secs);
+    let wal_replication_interval =
+        Duration::from_secs(config.wal_replication_interval_secs.max(1));
+
+    // WAL processing + replica shipping. Runs both phases in sequence so a
+    // segment encrypted on this tick can be shipped on the same tick.
+    let wal_state = state.clone();
+    tokio::spawn(async move {
+        // Brief startup delay so the first call doesn't race with router
+        // bind / database open.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut interval = tokio::time::interval(wal_replication_interval);
+        // The first tick fires immediately, then on each interval.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(e) = wal_state.replication.process_new_segments().await {
+                warn!(error = %e, "WAL processing pass failed");
+            }
+            if let Err(e) = wal_state.replication.ship_pending_segments().await {
+                warn!(error = %e, "WAL shipment pass failed");
+            }
+        }
+    });
+
+    // Cleanup expired instances.
+    let cleanup_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cleanup_interval);
+        loop {
+            interval.tick().await;
+            match cleanup_state.manager.cleanup_expired().await {
+                Ok(ids) if !ids.is_empty() => {
+                    info!(count = ids.len(), "cleaned up expired instances");
+                }
+                Err(e) => {
+                    warn!(error = %e, "cleanup sweep failed");
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Warm pool maintenance.
+    let warm_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Err(e) = warm_state.warm_pool.maintain().await {
+                warn!(error = %e, "warm pool maintenance failed");
+            }
+        }
+    });
+
+    // Heartbeat (placeholder — logs for now).
+    let region = config.region.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(heartbeat_interval);
+        loop {
+            interval.tick().await;
+            match state.manager.get_stats() {
+                Ok(stats) => {
+                    info!(
+                        region = %region,
+                        running = stats.running_instances,
+                        capacity = stats.available_capacity,
+                        "heartbeat"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "heartbeat stats failed");
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown
+// ---------------------------------------------------------------------------
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received Ctrl+C, shutting down"),
+        _ = terminate => info!("received SIGTERM, shutting down"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup banner
+// ---------------------------------------------------------------------------
+
+fn print_banner(config: &Config) {
+    let tee_status = match config.tee_backend.as_str() {
+        "sev-snp" => "AMD SEV-SNP (active)",
+        "tdx" => "Intel TDX (active)",
+        _ => "none (WARNING: not running in a TEE)",
+    };
+
+    info!("==========================================================");
+    info!("  Supaba Node v{}", env!("CARGO_PKG_VERSION"));
+    info!("==========================================================");
+    info!("  TEE backend   : {}", tee_status);
+    info!("  Region         : {}", config.region);
+    info!("  Max instances  : {}", config.max_instances);
+    info!("  Port range     : {}-{}", config.port_range_start, config.port_range_end);
+    info!("  CPU cores      : {}", config.available_cpu_cores);
+    info!("  Data dir       : {:?}", config.data_dir);
+    info!("  Attestation    : {}", if config.require_attestation { "required" } else { "disabled" });
+    info!("==========================================================");
+}

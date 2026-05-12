@@ -1,0 +1,41 @@
+# Caddy config for the Phase 3 wildcard Studio subdomain.
+#
+# Replace `studio.kraph.com` with your apex (must match
+# SUPABA_STUDIO_APEX on every node-rs and on the gateway).
+# Replace `:3401` with this node's SUPABA_API_PORT.
+#
+# DNS prerequisite: a wildcard A record `*.studio.kraph.com` pointing
+# at this node's public IP. Caddy auto-provisions a wildcard cert via
+# Let's Encrypt's DNS-01 challenge, so you'll need a DNS-API plugin
+# (caddy-dns/cloudflare, route53, etc.) and credentials in /etc/caddy/.
+#
+# Run with:  caddy run --config /etc/caddy/Caddyfile
+
+*.studio.kraph.com {
+    # Wildcard cert via DNS-01. Replace `cloudflare` with your DNS provider
+    # plugin and supply the API token via env or Caddy's tls config.
+    tls {
+        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+    }
+
+    # Every request goes through node-rs's forward-auth, which:
+    #   - validates the kraph_studio cookie's HMAC + binds it to the host
+    #   - returns 200 + X-Kraph-Studio-Port: <port> on success
+    #   - lets through /__kraph/studio/exchange so the cookie can be set
+    forward_auth http://127.0.0.1:3401 {
+        uri /__kraph/studio/forward-auth
+        copy_headers Cookie {>X-Kraph-Studio-Port}
+    }
+
+    # The exchange endpoint is owned by node-rs (it sets the cookie + 302).
+    # All other paths route to the per-instance Studio container, whose
+    # port came back in the X-Kraph-Studio-Port header from forward-auth.
+    @exchange path /__kraph/studio/*
+    handle @exchange {
+        reverse_proxy http://127.0.0.1:3401
+    }
+
+    handle {
+        reverse_proxy 127.0.0.1:{header.X-Kraph-Studio-Port}
+    }
+}

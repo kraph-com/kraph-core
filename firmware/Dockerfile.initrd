@@ -1,0 +1,121 @@
+# Reproducible initrd for Supaba confidential VMs
+#
+# This builds a minimal Alpine-based initial ramdisk containing:
+# - Docker daemon + containerd
+# - Supaba node software
+# - Attestation agent (snpguest for SEV-SNP, tdx-tools for TDX)
+# - Minimal init system
+#
+# The initrd is loaded into guest memory at boot and included in the
+# TEE measurement. Everything in this image is part of the trust chain.
+#
+# Build: docker build -f Dockerfile.initrd -o out .
+
+FROM alpine:3.20 AS base
+
+# ─── System packages ──────────────────────────────────────────────────────────
+RUN apk add --no-cache \
+    # Container runtime
+    docker-engine=26.1.5-r0 \
+    containerd=1.7.20-r0 \
+    docker-compose=2.28.1-r0 \
+    # Networking
+    iptables \
+    ip6tables \
+    iproute2 \
+    bridge-utils \
+    # Crypto / TLS
+    openssl \
+    ca-certificates \
+    # Runtime
+    # No Node.js — Supaba node is a static Rust binary \
+    # Filesystem
+    e2fsprogs \
+    xfsprogs \
+    lvm2 \
+    # Utilities
+    bash \
+    curl \
+    jq \
+    util-linux \
+    procps \
+    # SEV-SNP attestation tools
+    && rm -rf /var/cache/apk/*
+
+# ─── Install snpguest (SEV-SNP attestation agent) ────────────────────────────
+# Built from source for reproducibility
+FROM rust:1.79-alpine3.20 AS snpguest-builder
+
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static git
+
+WORKDIR /build
+RUN git clone --depth 1 --branch v0.8.0 \
+    https://github.com/virtee/snpguest.git && \
+    cd snpguest && \
+    cargo build --release --target x86_64-unknown-linux-musl
+
+# ─── Install TDX tools ───────────────────────────────────────────────────────
+FROM golang:1.22-alpine3.20 AS tdx-builder
+
+RUN apk add --no-cache git build-base
+
+WORKDIR /build
+RUN git clone --depth 1 --branch v1.5.0 \
+    https://github.com/intel/trustauthority-client-for-go.git && \
+    cd trustauthority-client-for-go/tdx-cli && \
+    CGO_ENABLED=0 go build -o /tdx_attest ./cmd/...
+
+# ─── Build Supaba node (Rust — single static binary) ─────────────────────────
+FROM rust:1.79-alpine3.20 AS supaba-builder
+
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf git
+
+WORKDIR /build
+COPY packages/node-rs ./packages/node-rs
+
+# Build a fully static binary — no runtime dependencies
+RUN cd packages/node-rs && \
+    RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo build --release --target x86_64-unknown-linux-musl
+
+# Result: ~5-10MB static binary vs ~200MB Node.js + node_modules
+
+# ─── Assemble initrd filesystem ──────────────────────────────────────────────
+FROM base AS initrd
+
+# Copy attestation tools
+COPY --from=snpguest-builder /build/snpguest/target/x86_64-unknown-linux-musl/release/snpguest /usr/bin/snpguest
+COPY --from=tdx-builder /tdx_attest /usr/bin/tdx_attest
+
+# Copy Supaba node — single static binary, no runtime deps
+COPY --from=supaba-builder /build/packages/node-rs/target/x86_64-unknown-linux-musl/release/supaba-node /usr/bin/supaba-node
+COPY packages/node/docker/supabase-template /opt/supaba/docker/supabase-template
+
+# Copy init script
+COPY scripts/init.sh /init
+RUN chmod +x /init
+
+# Copy Docker daemon config
+COPY config/docker-daemon.json /etc/docker/daemon.json
+
+# Copy the Supaba node config
+COPY config/supaba-node.env /etc/supaba/node.env
+
+# Set up required directories
+RUN mkdir -p /var/run /var/log /tmp /root/.supaba/node \
+    /var/lib/docker /var/lib/containerd \
+    /etc/docker/certs.d
+
+# ─── Build cpio initrd ───────────────────────────────────────────────────────
+FROM alpine:3.20 AS packer
+
+COPY --from=initrd / /rootfs
+
+RUN apk add --no-cache cpio zstd && \
+    cd /rootfs && \
+    find . -print0 | cpio --null -o -H newc 2>/dev/null | \
+    zstd -19 -T0 > /initrd.img
+
+# ─── Output ──────────────────────────────────────────────────────────────────
+FROM scratch AS output
+COPY --from=packer /initrd.img /initrd.img

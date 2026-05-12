@@ -1,0 +1,55 @@
+# Reproducible minimal Linux kernel for Supaba confidential VMs
+#
+# Builds a kernel with:
+# - AMD SEV-SNP guest support (CONFIG_SEV_GUEST, /dev/sev-guest)
+# - Intel TDX guest support (CONFIG_TDX_GUEST, /dev/tdx-guest)
+# - Virtio drivers (network, block, console)
+# - Docker/container support (cgroups v2, namespaces, overlayfs)
+# - Minimal footprint — no unnecessary drivers
+#
+# Build: docker build -f Dockerfile.kernel -o out .
+
+FROM alpine:3.20 AS builder
+
+ARG KERNEL_VERSION=6.8.12
+ARG KERNEL_MAJOR=6
+
+RUN apk add --no-cache \
+    build-base \
+    bc \
+    bison \
+    flex \
+    elfutils-dev \
+    openssl-dev \
+    perl \
+    linux-headers \
+    xz \
+    wget \
+    diffutils \
+    findutils \
+    gmp-dev \
+    mpc1-dev \
+    mpfr-dev \
+    libelf \
+    zstd
+
+WORKDIR /build
+
+# Download kernel source
+RUN wget -q https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz && \
+    tar xf linux-${KERNEL_VERSION}.tar.xz && \
+    rm linux-${KERNEL_VERSION}.tar.xz
+
+WORKDIR /build/linux-${KERNEL_VERSION}
+
+# Copy our kernel config
+COPY config/kernel.config .config
+
+# Build kernel
+RUN make olddefconfig && \
+    make -j$(nproc) bzImage && \
+    make -j$(nproc) modules
+
+# ─── Output ──────────────────────────────────────────────────────────────────
+FROM scratch AS output
+COPY --from=builder /build/linux-*/arch/x86/boot/bzImage /vmlinuz
