@@ -350,8 +350,15 @@ echo "::kraph-migrate-result:: dump=$DUMP_RC restore=$RESTORE_RC"
                     // real cause (e.g. "OCI runtime exec failed: ...",
                     // "container ... not found", etc.) instead of the
                     // useless generic.
-                    Err(BollardError::DockerContainerWaitError { error, .. }) => {
-                        return Err(anyhow!("wait_container: {}", error));
+                    Err(BollardError::DockerContainerWaitError { error, code }) => {
+                        // bollard fires this for ANY non-zero container
+                        // exit. `error` is the Docker daemon's message
+                        // (usually empty if the container exited cleanly
+                        // with a non-zero rc), `code` is the exit code.
+                        // Empty error + exit code = "container ran, pg_dump
+                        // or pg_restore returned non-zero" — caller needs
+                        // the log_tail to know which step failed and why.
+                        return Ok::<i64, anyhow::Error>(code);
                     }
                     Err(e) => return Err(anyhow!("wait_container: {e}")),
                 }
