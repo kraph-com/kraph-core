@@ -228,9 +228,13 @@ pub async fn run_bulk_migration(
     // dump first, capture rc, then restore, capture rc. Costs a few
     // hundred MB of /tmp disk for a typical Supabase migration, well
     // within the container's writable layer.
+    // Fixed-path tempfile — container is single-purpose and short-
+    // lived, so we don't need mktemp's collision-avoidance. busybox
+    // mktemp's pattern syntax differs from GNU mktemp and was failing
+    // with "mktemp: : Invalid argument" before this.
     let script = format!(
         r#"set +e
-TMPDUMP=$(mktemp /tmp/kraph-migrate.XXXXXX.dump)
+TMPDUMP=/tmp/kraph-migrate.dump
 echo "[kraph-migrate] starting bulk pg_dump (exclude_schemas={exclude_count})"
 pg_dump {dump_args} > "$TMPDUMP"
 DUMP_RC=$?
