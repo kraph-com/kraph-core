@@ -201,31 +201,50 @@ pub async fn run_bulk_migration(
     dump_args.push("$KRAPH_SOURCE_URL".into());
 
     let parallel = req.parallel_jobs.unwrap_or(4).clamp(1, 16);
-    let restore_args: Vec<String> = vec![
+    // pg_restore rejects --single-transaction together with --jobs=N>1
+    // ("cannot specify both --single-transaction and multiple jobs"),
+    // so the two modes are mutually exclusive: either atomic-single
+    // (safer; partial restore rolls back) or parallel (faster on big
+    // schemas; partial restore leaves rows behind). Pick atomic when
+    // the caller didn't ask for parallel, parallel when they did.
+    let mut restore_args: Vec<String> = vec![
         "--no-owner".into(),
         "--no-privileges".into(),
         "--no-comments".into(),
         "--verbose".into(),
-        "--single-transaction".into(),
-        format!("--jobs={parallel}"),
-        "--dbname=$KRAPH_TARGET_URL".into(),
     ];
+    if parallel > 1 {
+        restore_args.push(format!("--jobs={parallel}"));
+    } else {
+        restore_args.push("--single-transaction".into());
+    }
+    restore_args.push("--dbname=$KRAPH_TARGET_URL".into());
 
-    // The shell script. pg_dump streams to stdout; pg_restore reads from
-    // stdin. Two-process pipeline inside one container = no intermediate
-    // disk for the dump file. We capture exit codes from BOTH processes
-    // via PIPESTATUS so the agent can tell whether the dump or the
-    // restore failed.
+    // POSIX-compatible script — busybox sh (postgres:17-alpine's
+    // default shell) doesn't support bash's ${PIPESTATUS[N]} array
+    // expansion, so the previous `pg_dump | pg_restore` pipeline with
+    // PIPESTATUS capture failed with "sh: syntax error: bad substitution"
+    // before either command got to run. Rewrite to use a temp file:
+    // dump first, capture rc, then restore, capture rc. Costs a few
+    // hundred MB of /tmp disk for a typical Supabase migration, well
+    // within the container's writable layer.
     let script = format!(
-        r#"set -o pipefail
-echo "[kraph-migrate] starting bulk pg_dump | pg_restore"
-echo "[kraph-migrate] exclude_schemas: {exclude_count}"
-pg_dump {dump_args} | pg_restore {restore_args}
-DUMP_RC=${{PIPESTATUS[0]}}
-RESTORE_RC=${{PIPESTATUS[1]}}
-echo "[kraph-migrate] pg_dump rc=$DUMP_RC"
+        r#"set +e
+TMPDUMP=$(mktemp /tmp/kraph-migrate.XXXXXX.dump)
+echo "[kraph-migrate] starting bulk pg_dump (exclude_schemas={exclude_count})"
+pg_dump {dump_args} > "$TMPDUMP"
+DUMP_RC=$?
+echo "[kraph-migrate] pg_dump rc=$DUMP_RC dump_size=$(wc -c < "$TMPDUMP" 2>/dev/null || echo 0)"
+if [ $DUMP_RC -ne 0 ]; then
+  rm -f "$TMPDUMP"
+  echo "::kraph-migrate-result:: dump=$DUMP_RC restore=skipped"
+  exit $DUMP_RC
+fi
+echo "[kraph-migrate] starting pg_restore"
+pg_restore {restore_args} "$TMPDUMP"
+RESTORE_RC=$?
+rm -f "$TMPDUMP"
 echo "[kraph-migrate] pg_restore rc=$RESTORE_RC"
-# Surface a structured tail so the gateway can parse it cleanly.
 echo "::kraph-migrate-result:: dump=$DUMP_RC restore=$RESTORE_RC"
 [ $DUMP_RC -eq 0 ] && [ $RESTORE_RC -eq 0 ]
 "#,
