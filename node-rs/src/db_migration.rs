@@ -343,6 +343,16 @@ echo "::kraph-migrate-result:: dump=$DUMP_RC restore=$RESTORE_RC"
                     Err(BollardError::DockerResponseServerError {
                         status_code: 404, ..
                     }) => return Ok::<i64, anyhow::Error>(137),
+                    // DockerContainerWaitError's Display is literally
+                    // "Docker container wait error" — the actual daemon
+                    // error string is in the `error` field which Display
+                    // drops. Extract it explicitly so callers see the
+                    // real cause (e.g. "OCI runtime exec failed: ...",
+                    // "container ... not found", etc.) instead of the
+                    // useless generic.
+                    Err(BollardError::DockerContainerWaitError { error, .. }) => {
+                        return Err(anyhow!("wait_container: {}", error));
+                    }
                     Err(e) => return Err(anyhow!("wait_container: {e}")),
                 }
             }
