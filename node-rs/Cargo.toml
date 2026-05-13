@@ -65,6 +65,11 @@ walkdir = "2"
 # URL encoding for postgres-password embedding in the migration target URL.
 urlencoding = "2"
 
+# Tar.gz extraction for the Next.js sidecar deploy path (the gateway uploads
+# a standalone build as a single tar.gz; we extract on the node).
+tar = "0.4"
+flate2 = "1"
+
 # JWT (for Supabase key generation)
 # Use hmac/sha2 directly instead of jsonwebtoken to avoid ring dependency
 hmac = "0.12"

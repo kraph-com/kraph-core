@@ -179,4 +179,15 @@ pub const SOFT_MIGRATIONS: &[&str] = &[
     "ALTER TABLE instances ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'running'",
     "ALTER TABLE instances ADD COLUMN last_seen_at INTEGER",
     "ALTER TABLE instances ADD COLUMN pinned_until INTEGER",
+    // Next.js service: per-instance optional Node sidecar that joins the
+    // instance's docker network and runs `node server.js` from a Next.js
+    // standalone build. Port is allocated from the same pool as the
+    // Supabase ports. `nextjs_service_status` is one of:
+    //   NULL     — no service deployed (the default, ipfs-pinned frontends)
+    //   deploying
+    //   running
+    //   failed
+    "ALTER TABLE instances ADD COLUMN nextjs_service_port INTEGER",
+    "ALTER TABLE instances ADD COLUMN nextjs_service_status TEXT",
+    "ALTER TABLE instances ADD COLUMN nextjs_service_deployed_at INTEGER",
 ];

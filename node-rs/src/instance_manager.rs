@@ -368,6 +368,9 @@ impl InstanceManager {
             lifecycle_state: "running".to_string(),
             last_seen_at: None,
             pinned_until: None,
+            nextjs_service_port: None,
+            nextjs_service_status: None,
+            nextjs_service_deployed_at: None,
         };
         self.db.insert_instance(&instance)?;
         self.db.bind_port_to_instance(base_port, &id)?;
@@ -574,6 +577,9 @@ impl InstanceManager {
             lifecycle_state: "running".to_string(),
             last_seen_at: None,
             pinned_until: None,
+            nextjs_service_port: None,
+            nextjs_service_status: None,
+            nextjs_service_deployed_at: None,
         };
         self.db.insert_instance(&instance)?;
 

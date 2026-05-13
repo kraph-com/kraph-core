@@ -92,6 +92,29 @@ pub struct BuildAndPinRequest {
     /// to the build process and any postinstall scripts in the tree).
     #[serde(rename = "envVars", default)]
     pub env_vars: HashMap<String, String>,
+    /// What to do with the build output. "ipfs_pin" (default) pins the
+    /// output directory to Kubo and returns an IPFS CID. "nextjs_service"
+    /// hands the output to the per-instance Next.js sidecar — see
+    /// `nextjs_service::NextjsService`. The latter requires the build
+    /// to produce a Next.js standalone output (output_dir typically
+    /// `.next/standalone` with public/ and .next/static/ copied in).
+    #[serde(rename = "target", default)]
+    pub target: Option<String>,
+}
+
+/// Which distribution path to take after the build container exits.
+pub enum BuildTarget {
+    IpfsPin,
+    NextjsService,
+}
+
+impl BuildTarget {
+    pub fn from_request(req: &BuildAndPinRequest) -> Self {
+        match req.target.as_deref() {
+            Some("nextjs_service") => BuildTarget::NextjsService,
+            _ => BuildTarget::IpfsPin,
+        }
+    }
 }
 
 /// Successful build result.
@@ -106,6 +129,18 @@ pub struct BuildAndPinResult {
     pub exit_code: i64,
 }
 
+/// Result of a successful build whose output sits at `output_root` on the
+/// host filesystem, ready for a downstream distribution step (IPFS pin or
+/// Next.js sidecar deploy). The tempdir guard must outlive the consumer.
+pub struct BuildArtifacts {
+    pub output_root: std::path::PathBuf,
+    pub build_log: String,
+    pub exit_code: i64,
+    pub duration_ms: u128,
+    /// Owns the temp workspace. Drop after the consumer has copied bytes out.
+    pub _workdir_guard: tempfile::TempDir,
+}
+
 /// Run a frontend build inside a sandboxed container, then pin the output dir
 /// to local Kubo. Caller is responsible for the instance-ownership check.
 pub async fn build_and_pin(
@@ -115,6 +150,74 @@ pub async fn build_and_pin(
     api_port: u16,
     req: BuildAndPinRequest,
 ) -> Result<BuildAndPinResult> {
+    let artifacts = build_to_artifacts(docker, &req).await?;
+    let output_root = artifacts.output_root.clone();
+
+    // Walk /output, build a multipart form, push to local Kubo.
+    let pinned = pin_directory_to_kubo(kubo_api_url, &output_root).await?;
+    let duration_ms = artifacts.duration_ms;
+
+    // The Kraph IPFS gateway is a single global service — every node's
+    // pins are served from ipfs.kraph.com regardless of where the build
+    // ran. Don't parameterize on per-node public_host (that previously
+    // produced `https://ipfs./<cid>/` on nodes where SUPABA_PUBLIC_HOST
+    // was unset).
+    let public = format!("https://ipfs.kraph.com/{}/", pinned.cid);
+    let _ = public_host;
+    info!(
+        cid = %pinned.cid,
+        files = pinned.file_count,
+        size = pinned.size_bytes,
+        duration_ms,
+        wallet = %req.wallet_pubkey,
+        "frontend built + pinned"
+    );
+
+    // public_host ↔ api_port unused on the public path, but kept so the
+    // signature parallels ipfs_pin_handler's "where can I view this CID".
+    let _ = api_port;
+    // artifacts.workdir_guard drops here, cleaning the tempdir.
+    let result = BuildAndPinResult {
+        cid: pinned.cid,
+        url: public,
+        size_bytes: pinned.size_bytes,
+        file_count: pinned.file_count,
+        duration_ms,
+        build_log: artifacts.build_log,
+        exit_code: artifacts.exit_code,
+    };
+    drop(artifacts._workdir_guard);
+    Ok(result)
+}
+
+/// Pack the contents of `root` into a deterministic-ish tar.gz, returning
+/// the compressed bytes. Used to hand the Next.js standalone build to the
+/// per-instance sidecar deploy endpoint without writing an intermediate
+/// file. Errors propagate; tempdirs are not touched.
+pub fn tarball_from_dir(root: &Path) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+        let mut tar = tar::Builder::new(enc);
+        // tar.append_dir_all preserves directory structure under the
+        // base path inside the archive. We use "" so entries unpack at
+        // the root of the destination dir, which matches what
+        // nextjs_service::deploy() expects.
+        tar.append_dir_all(".", root)
+            .with_context(|| format!("tar pack {}", root.display()))?;
+        tar.finish().context("tar finish")?;
+    }
+    Ok(buf)
+}
+
+/// Run a frontend build inside a sandboxed container and return the path to
+/// the populated `/output` dir on the host, plus build metadata. The
+/// returned `BuildArtifacts` owns the tempdir guard — don't drop until the
+/// caller has consumed the output.
+pub async fn build_to_artifacts(
+    docker: Arc<Docker>,
+    req: &BuildAndPinRequest,
+) -> Result<BuildArtifacts> {
     let started = Instant::now();
 
     let install_cmd = req
@@ -389,43 +492,15 @@ echo '[kraph-build] done'
         ));
     }
 
-    // Walk /output, build a multipart form, push to local Kubo.
     let output_root = workdir_path.join("output");
-    let pinned = pin_directory_to_kubo(kubo_api_url, &output_root).await?;
     let duration_ms = started.elapsed().as_millis();
 
-    // The Kraph IPFS gateway is a single global service — every node's
-    // pins are served from ipfs.kraph.com regardless of where the build
-    // ran. Don't parameterize on per-node public_host (that previously
-    // produced `https://ipfs./<cid>/` on nodes where SUPABA_PUBLIC_HOST
-    // was unset).
-    let public = format!("https://ipfs.kraph.com/{}/", pinned.cid);
-    let _ = public_host;
-    info!(
-        cid = %pinned.cid,
-        files = pinned.file_count,
-        size = pinned.size_bytes,
-        duration_ms,
-        wallet = %req.wallet_pubkey,
-        "frontend built + pinned"
-    );
-
-    // Tempdir auto-cleans on drop; binding a `let _ = workdir;` keeps the
-    // borrow alive until here. (We've already `await`ed past the drop point
-    // so it's fine; explicit drop for clarity.)
-    drop(workdir);
-    // public_host ↔ api_port unused on the public path, but kept so the
-    // signature parallels ipfs_pin_handler's "where can I view this CID".
-    let _ = api_port;
-
-    Ok(BuildAndPinResult {
-        cid: pinned.cid,
-        url: public,
-        size_bytes: pinned.size_bytes,
-        file_count: pinned.file_count,
-        duration_ms,
+    Ok(BuildArtifacts {
+        output_root,
         build_log,
         exit_code,
+        duration_ms,
+        _workdir_guard: workdir,
     })
 }
 
