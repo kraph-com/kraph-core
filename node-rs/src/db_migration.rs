@@ -51,9 +51,20 @@ pub(crate) fn clamp_timeout_secs(supplied: Option<u64>) -> u64 {
 pub struct MigrationStartRequest {
     #[serde(rename = "walletPubkey")]
     pub wallet_pubkey: String,
-    /// Source `postgres://...` URL. Includes credentials.
-    #[serde(rename = "sourceUrl")]
+    /// Source `postgres://...` URL with credentials. Either this OR
+    /// `source_url_env` must be set; the handler in main.rs resolves
+    /// `source_url_env` (name of an env var in the instance's encrypted
+    /// env store) and overwrites `source_url` with the plaintext value
+    /// before passing this struct to `run_bulk_migration` / `run_live_sync_setup`,
+    /// so the inner pipeline always sees a resolved plaintext URL.
+    #[serde(default, rename = "sourceUrl")]
     pub source_url: String,
+    /// Name of an env var on this instance (kraph_set_env) holding the
+    /// source URL. The wire-side caller (agent) passes this instead of
+    /// `source_url` so the credential never appears in chat / transcript /
+    /// SSE / Anthropic history. Resolved server-side by the HTTP handler.
+    #[serde(default, rename = "sourceUrlEnv")]
+    pub source_url_env: Option<String>,
     /// Target instance's local Postgres URL. Constructed by the HTTP handler
     /// from the instance row (host.docker.internal + external port +
     /// stored postgres_password). Don't accept from the request body —

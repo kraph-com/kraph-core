@@ -1269,8 +1269,55 @@ async fn build_and_pin_handler(
 struct MigrateProbeRequest {
     #[serde(rename = "walletPubkey")]
     wallet_pubkey: String,
-    #[serde(rename = "sourceUrl")]
-    source_url: String,
+    /// Either source_url OR source_url_env must be present, not both.
+    /// source_url is the legacy plaintext form (URL with credentials).
+    /// source_url_env names a key in the instance's encrypted env store
+    /// (instance_env table) — the node resolves it locally so the URL
+    /// never appears on the wire, in the agent chat history, or in the
+    /// transcript.
+    #[serde(default, rename = "sourceUrl")]
+    source_url: Option<String>,
+    #[serde(default, rename = "sourceUrlEnv")]
+    source_url_env: Option<String>,
+}
+
+/// Resolve `(source_url, source_url_env)` to a plaintext URL. Exactly
+/// one of the two must be set. When source_url_env is used, the value
+/// comes from this instance's encrypted env store (instance_env table,
+/// XChaCha20 under the per-instance DEK). That way the agent only ever
+/// sees / passes the env-var NAME, not the URL — credentials don't
+/// land in the chat transcript, the Anthropic message history, or the
+/// SSE event stream.
+fn resolve_source_url(
+    db: &Database,
+    instance_id: &str,
+    source_url: Option<&str>,
+    source_url_env: Option<&str>,
+) -> Result<String, anyhow::Error> {
+    match (source_url, source_url_env) {
+        (Some(u), None) if !u.is_empty() => Ok(u.to_string()),
+        (None, Some(name)) | (Some(""), Some(name)) if !name.is_empty() => {
+            let entries = db.list_env(instance_id)?;
+            entries
+                .into_iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "sourceUrlEnv: env var '{}' not set on instance {}. \
+                         Set it via kraph_set_env first.",
+                        name,
+                        instance_id
+                    )
+                })
+        }
+        (Some(_), Some(_)) => Err(anyhow::anyhow!(
+            "pass exactly ONE of sourceUrl or sourceUrlEnv, not both"
+        )),
+        _ => Err(anyhow::anyhow!(
+            "must pass either sourceUrl (plaintext) or sourceUrlEnv (env var name on the instance)"
+        )),
+    }
 }
 
 async fn migrate_probe_handler(
@@ -1313,7 +1360,25 @@ async fn migrate_probe_handler(
         bollard::Docker::connect_with_local_defaults()
             .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?,
     );
-    match db_migration::probe_source(docker, &req.source_url).await {
+    let resolved_source_url = match resolve_source_url(
+        &state.db,
+        &id,
+        req.source_url.as_deref(),
+        req.source_url_env.as_deref(),
+    ) {
+        Ok(u) => u,
+        Err(e) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "source_url_unresolved",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response());
+        }
+    };
+    match db_migration::probe_source(docker, &resolved_source_url).await {
         Ok(probe) => Ok((StatusCode::OK, Json(serde_json::to_value(probe)?)).into_response()),
         Err(e) => Ok((
             StatusCode::BAD_GATEWAY,
@@ -1397,6 +1462,45 @@ async fn migrate_start_handler(
         urlencoding::encode(&inst.postgres_password),
         pg_external_port
     );
+    // Resolve sourceUrlEnv → plaintext source_url server-side, so the
+    // inner pipeline (which passes source_url into env KRAPH_SOURCE_URL
+    // for the migration container) sees a real URL. The wire-side
+    // caller / agent only sees the env var NAME — the credential never
+    // touches the chat transcript, the SSE stream, or the Anthropic
+    // message history.
+    let source_url_for_log = if req.source_url_env.is_some() {
+        format!("<env:{}>", req.source_url_env.as_deref().unwrap_or(""))
+    } else {
+        "<inline>".to_string()
+    };
+    let resolved_source_url = match resolve_source_url(
+        &state.db,
+        &id,
+        if req.source_url.is_empty() {
+            None
+        } else {
+            Some(req.source_url.as_str())
+        },
+        req.source_url_env.as_deref(),
+    ) {
+        Ok(u) => u,
+        Err(e) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "source_url_unresolved",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response());
+        }
+    };
+    req.source_url = resolved_source_url;
+    tracing::info!(
+        instance_id = %id,
+        source = %source_url_for_log,
+        "migrate_start: resolved source URL"
+    );
     let docker = std::sync::Arc::new(
         bollard::Docker::connect_with_local_defaults()
             .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?,
@@ -1447,8 +1551,12 @@ async fn migrate_start_handler(
 struct MigrateCutoverRequest {
     #[serde(rename = "walletPubkey")]
     wallet_pubkey: String,
-    #[serde(rename = "sourceUrl")]
-    source_url: String,
+    #[serde(default, rename = "sourceUrl")]
+    source_url: Option<String>,
+    /// Name of an env var on this instance holding the source URL.
+    /// See MigrateProbeRequest::source_url_env for the rationale.
+    #[serde(default, rename = "sourceUrlEnv")]
+    source_url_env: Option<String>,
     #[serde(default, rename = "maxWaitSecs")]
     max_wait_secs: Option<u64>,
 }
@@ -1501,11 +1609,29 @@ async fn migrate_cutover_handler(
             .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?,
     );
     let cutover_container = format!("kraph-cutover-{}", nanoid::nanoid!(8).to_lowercase());
+    let resolved_source_url = match resolve_source_url(
+        &state.db,
+        &id,
+        req.source_url.as_deref(),
+        req.source_url_env.as_deref(),
+    ) {
+        Ok(u) => u,
+        Err(e) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "source_url_unresolved",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response());
+        }
+    };
     match db_migration::run_live_sync_cutover(
         docker,
         &cutover_container,
         &pubsub,
-        &req.source_url,
+        &resolved_source_url,
         &target_url,
         req.max_wait_secs.unwrap_or(15 * 60),
     )
