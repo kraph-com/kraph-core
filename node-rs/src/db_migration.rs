@@ -223,7 +223,12 @@ echo "::kraph-migrate-result:: dump=$DUMP_RC restore=$RESTORE_RC"
         exclude_count = exclude_schemas.len(),
     );
 
-    let image = "postgres:16-alpine".to_string();
+    // postgres:17-alpine ships pg_dump 17. pg_dump 17 can dump v13–v17
+    // sources; pg_dump 16 REFUSED v17 sources with the version-mismatch
+    // error (Supabase moved free-tier projects to PG17), exited
+    // immediately, and the empty container surfaced only as the generic
+    // "wait_container: Docker container wait error" on the agent side.
+    let image = "postgres:17-alpine".to_string();
     pull_image_if_missing(&docker, &image).await?;
 
     let env: Vec<String> = vec![
@@ -518,7 +523,12 @@ echo "::kraph-migrate-result:: dump=$DUMP_RC restore=$RESTORE_RC pub=$PUB_RC sub
         restore_args = restore_args.join(" "),
     );
 
-    let image = "postgres:16-alpine".to_string();
+    // postgres:17-alpine ships pg_dump 17. pg_dump 17 can dump v13–v17
+    // sources; pg_dump 16 REFUSED v17 sources with the version-mismatch
+    // error (Supabase moved free-tier projects to PG17), exited
+    // immediately, and the empty container surfaced only as the generic
+    // "wait_container: Docker container wait error" on the agent side.
+    let image = "postgres:17-alpine".to_string();
     pull_image_if_missing(&docker, &image).await?;
     let env: Vec<String> = vec![
         format!("KRAPH_SOURCE_URL={}", req.source_url),
@@ -671,7 +681,12 @@ echo "::kraph-migrate-result:: caught_up=true"
         pubsub = pubsub_name,
         max_wait_secs = max_wait_secs,
     );
-    let image = "postgres:16-alpine".to_string();
+    // postgres:17-alpine ships pg_dump 17. pg_dump 17 can dump v13–v17
+    // sources; pg_dump 16 REFUSED v17 sources with the version-mismatch
+    // error (Supabase moved free-tier projects to PG17), exited
+    // immediately, and the empty container surfaced only as the generic
+    // "wait_container: Docker container wait error" on the agent side.
+    let image = "postgres:17-alpine".to_string();
     pull_image_if_missing(&docker, &image).await?;
     let env = vec![
         format!("KRAPH_SOURCE_URL={}", source_url),
@@ -923,7 +938,12 @@ pub async fn probe_source(
     docker: Arc<Docker>,
     source_url: &str,
 ) -> Result<SourceProbe> {
-    let image = "postgres:16-alpine".to_string();
+    // postgres:17-alpine ships pg_dump 17. pg_dump 17 can dump v13–v17
+    // sources; pg_dump 16 REFUSED v17 sources with the version-mismatch
+    // error (Supabase moved free-tier projects to PG17), exited
+    // immediately, and the empty container surfaced only as the generic
+    // "wait_container: Docker container wait error" on the agent side.
+    let image = "postgres:17-alpine".to_string();
     pull_image_if_missing(&docker, &image).await?;
 
     let script = r#"set -e
