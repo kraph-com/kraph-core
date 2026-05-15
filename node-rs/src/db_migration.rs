@@ -235,6 +235,8 @@ pub async fn run_bulk_migration(
     let script = format!(
         r#"set +e
 TMPDUMP=/tmp/kraph-migrate.dump
+TMPTOC=/tmp/kraph-migrate.toc
+TMPTOC_FILTERED=/tmp/kraph-migrate.toc.filtered
 echo "[kraph-migrate] starting bulk pg_dump (exclude_schemas={exclude_count})"
 pg_dump {dump_args} > "$TMPDUMP"
 DUMP_RC=$?
@@ -244,10 +246,36 @@ if [ $DUMP_RC -ne 0 ]; then
   echo "::kraph-migrate-result:: dump=$DUMP_RC restore=skipped"
   exit $DUMP_RC
 fi
+# Filter EVENT TRIGGER entries out of the TOC. Supabase sources ship
+# event triggers (pgrst_ddl_watch, pgrst_drop_watch, issue_pg_cron_access,
+# issue_pg_graphql_access, issue_pg_net_access, issue_graphql_placeholder,
+# ensure_rls) that require superuser to create AND already exist on the
+# target Kraph Supabase image (same upstream). Without this filter
+# pg_restore emits 7+ "permission denied" errors per Supabase source
+# and exits 1 even though the user's actual data was fully restored.
+# pg_restore -l prints the TOC in editable form; lines starting with ';'
+# are comments. Removing the EVENT TRIGGER lines from the TOC tells
+# pg_restore -L to skip those objects entirely.
+pg_restore -l "$TMPDUMP" > "$TMPTOC" 2>/dev/null
+TOC_RC=$?
+if [ $TOC_RC -ne 0 ]; then
+  echo "[kraph-migrate] pg_restore -l failed rc=$TOC_RC; proceeding without TOC filter"
+  TMPTOC_FILTERED=""
+else
+  grep -v "EVENT TRIGGER" "$TMPTOC" > "$TMPTOC_FILTERED"
+  TOC_LINES=$(wc -l < "$TMPTOC" 2>/dev/null || echo 0)
+  FILTERED_LINES=$(wc -l < "$TMPTOC_FILTERED" 2>/dev/null || echo 0)
+  SKIPPED=$((TOC_LINES - FILTERED_LINES))
+  echo "[kraph-migrate] TOC filtered: $SKIPPED EVENT TRIGGER entries removed"
+fi
 echo "[kraph-migrate] starting pg_restore"
-pg_restore {restore_args} "$TMPDUMP"
+if [ -n "$TMPTOC_FILTERED" ] && [ -s "$TMPTOC_FILTERED" ]; then
+  pg_restore {restore_args} -L "$TMPTOC_FILTERED" "$TMPDUMP"
+else
+  pg_restore {restore_args} "$TMPDUMP"
+fi
 RESTORE_RC=$?
-rm -f "$TMPDUMP"
+rm -f "$TMPDUMP" "$TMPTOC" "$TMPTOC_FILTERED"
 echo "[kraph-migrate] pg_restore rc=$RESTORE_RC"
 echo "::kraph-migrate-result:: dump=$DUMP_RC restore=$RESTORE_RC"
 [ $DUMP_RC -eq 0 ] && [ $RESTORE_RC -eq 0 ]
