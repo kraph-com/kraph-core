@@ -295,7 +295,20 @@ impl ReplicationManager {
                 "-c",
                 "ALTER SYSTEM SET archive_command = 'test ! -f /var/lib/postgresql/wal-archive/%f && cp %p /var/lib/postgresql/wal-archive/%f'",
                 "-c",
-                "ALTER SYSTEM SET wal_level = replica",
+                // `logical` is a strict superset of `replica` — WAL
+                // archiving and physical replication still work, and we
+                // additionally get logical decoding which Supabase
+                // Realtime's `postgres_changes` channel needs. Setting
+                // this to `replica` (the previous value) silently broke
+                // Realtime CDC on every instance: WS upgrades succeed,
+                // channels can be joined, but Realtime crashes the
+                // replication-prep with `PoolingReplicationPreparationError:
+                // logical decoding requires wal_level >= logical` so no
+                // INSERT/UPDATE/DELETE events ever flow to subscribers.
+                // (Broadcast/presence work fine on `replica`; only CDC
+                // needs `logical`.) postgresql.conf already has logical;
+                // ALTER SYSTEM was overriding it via postgresql.auto.conf.
+                "ALTER SYSTEM SET wal_level = logical",
                 "-c",
                 "SELECT pg_reload_conf()",
             ])
