@@ -135,6 +135,13 @@ const DEFAULT_EXCLUDE_SCHEMAS: &[&str] = &[
     "_analytics",
     "pg_catalog",
     "information_schema",
+    // Supabase's connection-pooler schema. Created by Supabase's image
+    // bootstrap on both source AND target, so CREATE SCHEMA pgbouncer
+    // from the dump fails "already exists" on every Supabase→Kraph
+    // migration. Excluding it has no user-data consequence; the
+    // pgbouncer schema only holds infra functions like
+    // get_auth(user_role).
+    "pgbouncer",
 ];
 
 pub async fn run_bulk_migration(
@@ -569,25 +576,62 @@ pub async fn run_live_sync_setup(
         p = pubsub_name,
     );
 
+    // busybox sh (postgres:17-alpine's default shell) doesn't support
+    // bash's `set -o pipefail` or `${PIPESTATUS[N]}` — both fail with
+    // "syntax error: bad substitution" before pg_dump even runs.
+    // Rewrite using the same tempfile-based pattern as bulk_migration:
+    // dump first → capture rc → filter TOC → restore → capture rc.
+    // Costs a bit of /tmp disk but is the only portable approach.
     let script = format!(
-        r#"set -o pipefail
-echo "[kraph-migrate] live_sync setup phase 1: schema dump + restore"
-pg_dump {dump_args} | pg_restore {restore_args}
-DUMP_RC=${{PIPESTATUS[0]}}
-RESTORE_RC=${{PIPESTATUS[1]}}
-echo "[kraph-migrate] schema phase rc=dump:$DUMP_RC restore:$RESTORE_RC"
-[ $DUMP_RC -eq 0 ] && [ $RESTORE_RC -eq 0 ] || {{
+        r#"set +e
+TMPDUMP=/tmp/kraph-migrate-live.dump
+TMPTOC=/tmp/kraph-migrate-live.toc
+TMPTOC_FILTERED=/tmp/kraph-migrate-live.toc.filtered
+echo "[kraph-migrate] live_sync setup phase 1a: schema dump"
+pg_dump {dump_args} > "$TMPDUMP"
+DUMP_RC=$?
+echo "[kraph-migrate] pg_dump rc=$DUMP_RC dump_size=$(wc -c < "$TMPDUMP" 2>/dev/null || echo 0)"
+if [ $DUMP_RC -ne 0 ]; then
+  rm -f "$TMPDUMP"
+  echo "::kraph-migrate-result:: dump=$DUMP_RC restore=skipped sub=skipped"
+  exit $DUMP_RC
+fi
+# Same EVENT TRIGGER filter the bulk path uses. Supabase sources ship
+# event triggers that need superuser to create AND already exist on
+# the target Kraph Supabase image.
+pg_restore -l "$TMPDUMP" > "$TMPTOC" 2>/dev/null
+TOC_RC=$?
+if [ $TOC_RC -ne 0 ]; then
+  echo "[kraph-migrate] pg_restore -l failed rc=$TOC_RC; proceeding without TOC filter"
+  TMPTOC_FILTERED=""
+else
+  grep -v "EVENT TRIGGER" "$TMPTOC" > "$TMPTOC_FILTERED"
+  TOC_LINES=$(wc -l < "$TMPTOC" 2>/dev/null || echo 0)
+  FILTERED_LINES=$(wc -l < "$TMPTOC_FILTERED" 2>/dev/null || echo 0)
+  SKIPPED=$((TOC_LINES - FILTERED_LINES))
+  echo "[kraph-migrate] TOC filtered: $SKIPPED EVENT TRIGGER entries removed"
+fi
+echo "[kraph-migrate] live_sync setup phase 1b: schema restore"
+if [ -n "$TMPTOC_FILTERED" ] && [ -s "$TMPTOC_FILTERED" ]; then
+  pg_restore {restore_args} -L "$TMPTOC_FILTERED" "$TMPDUMP"
+else
+  pg_restore {restore_args} "$TMPDUMP"
+fi
+RESTORE_RC=$?
+rm -f "$TMPDUMP" "$TMPTOC" "$TMPTOC_FILTERED"
+echo "[kraph-migrate] pg_restore rc=$RESTORE_RC"
+if [ $RESTORE_RC -ne 0 ]; then
   echo "::kraph-migrate-result:: dump=$DUMP_RC restore=$RESTORE_RC sub=skipped"
-  exit 1
-}}
+  exit $RESTORE_RC
+fi
 
 echo "[kraph-migrate] live_sync setup phase 2: create publication on source"
 psql "$KRAPH_SOURCE_URL" -v ON_ERROR_STOP=1 -c "{pub_sql}"
 PUB_RC=$?
-[ $PUB_RC -eq 0 ] || {{
+if [ $PUB_RC -ne 0 ]; then
   echo "::kraph-migrate-result:: dump=$DUMP_RC restore=$RESTORE_RC pub=$PUB_RC sub=skipped"
-  exit 1
-}}
+  exit $PUB_RC
+fi
 
 echo "[kraph-migrate] live_sync setup phase 3: create subscription on target"
 # pass the source URL via psql variable so it's not splatted into shell
