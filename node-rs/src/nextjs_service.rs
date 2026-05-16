@@ -106,7 +106,19 @@ impl NextjsService {
     /// host port we have to stop first; ~3s of downtime per redeploy
     /// is acceptable for MVP and matches how `kraph_deploy_function`
     /// behaves on Deno function updates).
-    pub async fn deploy(&self, instance_id: &str, wallet: &str, tarball: &[u8]) -> Result<DeployResult> {
+    ///
+    /// `entry_argv` is the command invoked inside the container, relative
+    /// to `/app`. Pass `["node", "server.js"]` for the Next.js standalone
+    /// convention, `["node", "build/index.js"]` for SvelteKit
+    /// adapter-node, `["node", ".output/server/index.mjs"]` for Nuxt,
+    /// etc. The argv reaches docker verbatim — no shell layer.
+    pub async fn deploy(
+        &self,
+        instance_id: &str,
+        wallet: &str,
+        tarball: &[u8],
+        entry_argv: Vec<String>,
+    ) -> Result<DeployResult> {
         // Ownership check is handled at the HTTP layer; this module
         // trusts its caller. We still verify the instance exists.
         let instance = self
@@ -154,22 +166,30 @@ impl NextjsService {
             entry.unpack_in(&staging)?;
         }
 
-        // The expected layout has a top-level `server.js`. Some tarballs
-        // wrap everything in a single directory (e.g. when packed via
-        // `tar -czf bundle.tgz nextjs-build/`); detect that and lift one
-        // level up. The build-side tool emits the flat form so this is a
-        // belt-and-braces guard.
-        let bundle_root = if staging.join("server.js").exists() {
+        // Determine the bundle root by locating the entry script. For
+        // Next.js this is `server.js`; for SvelteKit it's
+        // `build/index.js`; for Nuxt it's `.output/server/index.mjs`.
+        // We derive the relative path from `entry_argv[1]` (the script
+        // arg) — `entry_argv[0]` is always the binary like `node` and
+        // doesn't help us locate the bundle. Some tarballs wrap
+        // everything in a single directory (e.g. `tar -czf bundle.tgz
+        // myapp/`); detect that and lift one level up. The build-side
+        // tool emits the flat form so this is belt-and-braces.
+        let entry_script_rel: &str = entry_argv
+            .get(1)
+            .map(|s| s.as_str())
+            .unwrap_or("server.js");
+        let bundle_root = if staging.join(entry_script_rel).exists() {
             staging.clone()
         } else {
-            // Look for the single directory inside that contains server.js.
+            // Look for the single directory inside that contains the entry script.
             let entries: Vec<_> = std::fs::read_dir(&staging)?
                 .filter_map(Result::ok)
                 .collect();
             let candidate = entries
                 .iter()
-                .find(|e| e.path().is_dir() && e.path().join("server.js").exists())
-                .ok_or_else(|| anyhow!("bundle missing server.js (expected Next.js standalone output)"))?;
+                .find(|e| e.path().is_dir() && e.path().join(entry_script_rel).exists())
+                .ok_or_else(|| anyhow!("bundle missing entry script '{}'", entry_script_rel))?;
             candidate.path()
         };
 
@@ -289,7 +309,7 @@ impl NextjsService {
         };
         let config: ContainerConfig<String> = ContainerConfig {
             image: Some(NEXTJS_IMAGE.to_string()),
-            cmd: Some(vec!["node".to_string(), "server.js".to_string()]),
+            cmd: Some(entry_argv.clone()),
             working_dir: Some("/app".to_string()),
             env: Some(env),
             exposed_ports: Some(exposed_ports),

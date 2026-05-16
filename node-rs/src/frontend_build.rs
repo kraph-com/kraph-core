@@ -94,25 +94,77 @@ pub struct BuildAndPinRequest {
     pub env_vars: HashMap<String, String>,
     /// What to do with the build output. "ipfs_pin" (default) pins the
     /// output directory to Kubo and returns an IPFS CID. "nextjs_service"
-    /// hands the output to the per-instance Next.js sidecar — see
-    /// `nextjs_service::NextjsService`. The latter requires the build
-    /// to produce a Next.js standalone output (output_dir typically
-    /// `.next/standalone` with public/ and .next/static/ copied in).
+    /// hands the output to the per-instance Node sidecar with the
+    /// Next.js standalone convention (`node server.js`). "node_service"
+    /// runs an arbitrary `entryCommand` against the output directory —
+    /// works for SvelteKit (`node build/index.js`), Nuxt
+    /// (`node .output/server/index.mjs`), Remix, Hono, etc. All three
+    /// land in the same per-instance sidecar; the only difference is
+    /// which command starts the server.
     #[serde(rename = "target", default)]
     pub target: Option<String>,
+    /// Required when `target = "node_service"`. The shell-free argv used
+    /// to start the server inside the sidecar container, relative to the
+    /// bundle's `/app` cwd. Examples:
+    ///   ["node", "build/index.js"]      // SvelteKit adapter-node
+    ///   ["node", ".output/server/index.mjs"]  // Nuxt
+    ///   ["node", "server.js"]           // Next.js (or use target=nextjs_service)
+    /// Each arg is passed verbatim to `docker create --cmd`; there is no
+    /// shell layer, so `&&`, `$VAR`, redirections do NOT work — use a
+    /// startup script committed to the repo if you need shell features.
+    #[serde(rename = "entryCommand", default)]
+    pub entry_command: Option<Vec<String>>,
 }
 
 /// Which distribution path to take after the build container exits.
+///
+/// `NodeService` carries the start argv inline so a single sidecar
+/// implementation can host Next.js, SvelteKit, Nuxt, Remix, or any
+/// other framework that produces a long-running Node process.
 pub enum BuildTarget {
     IpfsPin,
-    NextjsService,
+    NodeService { entry: Vec<String> },
 }
 
 impl BuildTarget {
-    pub fn from_request(req: &BuildAndPinRequest) -> Self {
+    pub fn from_request(req: &BuildAndPinRequest) -> Result<Self, anyhow::Error> {
         match req.target.as_deref() {
-            Some("nextjs_service") => BuildTarget::NextjsService,
-            _ => BuildTarget::IpfsPin,
+            Some("nextjs_service") => Ok(BuildTarget::NodeService {
+                entry: vec!["node".to_string(), "server.js".to_string()],
+            }),
+            Some("node_service") => {
+                let entry = req
+                    .entry_command
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("entryCommand required for target=node_service"))?;
+                if entry.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "entryCommand must contain at least one element (the binary to run)"
+                    ));
+                }
+                // Defensive: reject any arg that looks like a shell
+                // metacharacter sneak-in. The argv is passed straight
+                // to docker (no shell), so these characters would be
+                // taken as literal filenames and fail confusingly — but
+                // bailing early gives a clearer error.
+                for a in &entry {
+                    if a.contains(';')
+                        || a.contains('|')
+                        || a.contains('&')
+                        || a.contains('`')
+                        || a.contains('\n')
+                    {
+                        return Err(anyhow::anyhow!(
+                            "entryCommand arg '{}' contains a shell metacharacter; \
+                             argv is passed straight to docker (no shell). Wrap \
+                             your startup in a script and run that instead.",
+                            a
+                        ));
+                    }
+                }
+                Ok(BuildTarget::NodeService { entry })
+            }
+            _ => Ok(BuildTarget::IpfsPin),
         }
     }
 }

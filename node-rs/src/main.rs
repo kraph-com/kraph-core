@@ -1240,8 +1240,21 @@ async fn build_and_pin_handler(
     );
 
     // Branch on the agent-requested distribution target. The build phase
-    // is identical for both — only the post-build step differs.
-    match frontend_build::BuildTarget::from_request(&req) {
+    // is identical for all variants — only the post-build step differs.
+    let build_target = match frontend_build::BuildTarget::from_request(&req) {
+        Ok(t) => t,
+        Err(e) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_target",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response());
+        }
+    };
+    match build_target {
         frontend_build::BuildTarget::IpfsPin => {
             match frontend_build::build_and_pin(
                 docker,
@@ -1275,10 +1288,19 @@ async fn build_and_pin_handler(
                     .into_response()),
             }
         }
-        frontend_build::BuildTarget::NextjsService => {
+        frontend_build::BuildTarget::NodeService { entry } => {
             // Build, then pack + hand off to the per-instance sidecar.
             // Wallet is taken from req (already sigauth'd above), instance
-            // id from the path param.
+            // id from the path param. `entry` is the argv used to launch
+            // the server inside the sidecar (Next.js: ["node",
+            // "server.js"]; SvelteKit: ["node", "build/index.js"]; etc).
+            // Reported back as `target` so the gateway knows whether
+            // this was the legacy nextjs_service shape or the generic
+            // node_service shape.
+            let reported_target = match req.target.as_deref() {
+                Some("nextjs_service") => "nextjs_service",
+                _ => "node_service",
+            };
             let wallet = req.wallet_pubkey.clone();
             let artifacts = match frontend_build::build_to_artifacts((*docker).clone().into(), &req).await {
                 Ok(a) => a,
@@ -1312,11 +1334,11 @@ async fn build_and_pin_handler(
                 state.config.data_dir.clone(),
                 state.config.public_host.clone(),
             );
-            match svc.deploy(&id, &wallet, &tarball).await {
+            match svc.deploy(&id, &wallet, &tarball, entry).await {
                 Ok(r) => Ok((
                     StatusCode::CREATED,
                     Json(serde_json::json!({
-                        "target": "nextjs_service",
+                        "target": reported_target,
                         "instance_id": r.instance_id,
                         "host_port": r.host_port,
                         "container_id": r.container_id,
@@ -1331,7 +1353,7 @@ async fn build_and_pin_handler(
                 Err(e) => Ok((
                     StatusCode::BAD_GATEWAY,
                     Json(serde_json::json!({
-                        "error": "nextjs_deploy_failed",
+                        "error": "node_service_deploy_failed",
                         "message": e.to_string(),
                         "buildLog": artifacts.build_log,
                     })),
@@ -1415,7 +1437,12 @@ async fn deploy_nextjs_service_handler(
         state.config.data_dir.clone(),
         state.config.public_host.clone(),
     );
-    match svc.deploy(&id, &q.wallet, &body_bytes).await {
+    // Legacy direct-deploy endpoint is Next.js-only — the standalone
+    // entry convention (`node server.js`). The newer build-and-pin
+    // path (POST /instances/:id/build-and-pin with target=node_service)
+    // supports arbitrary entry argv for SvelteKit / Nuxt / Remix etc.
+    let entry = vec!["node".to_string(), "server.js".to_string()];
+    match svc.deploy(&id, &q.wallet, &body_bytes, entry).await {
         Ok(r) => Ok((
             StatusCode::CREATED,
             Json(serde_json::json!({
@@ -1429,7 +1456,7 @@ async fn deploy_nextjs_service_handler(
         Err(e) => Ok((
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({
-                "error": "nextjs_deploy_failed",
+                "error": "node_service_deploy_failed",
                 "message": e.to_string(),
             })),
         )
