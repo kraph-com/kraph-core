@@ -399,6 +399,17 @@ struct InstanceQuery {
     wallet: String,
 }
 
+/// Query for the direct nextjs/node-service deploy endpoint. `entry` is
+/// an optional JSON-encoded string array (URL-encoded) that overrides
+/// the default `["node", "server.js"]` start argv — used by the gateway
+/// when the agent uploads a generic Node bundle (SvelteKit, Nuxt, Remix,
+/// etc.) instead of a Next.js standalone build.
+#[derive(Deserialize)]
+struct DeployServiceQuery {
+    wallet: String,
+    entry: Option<String>,
+}
+
 async fn get_instance_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1378,7 +1389,7 @@ async fn build_and_pin_handler(
 async fn deploy_nextjs_service_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Query(q): Query<InstanceQuery>, // reuses {wallet} shape
+    Query(q): Query<DeployServiceQuery>,
     headers: HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1437,11 +1448,53 @@ async fn deploy_nextjs_service_handler(
         state.config.data_dir.clone(),
         state.config.public_host.clone(),
     );
-    // Legacy direct-deploy endpoint is Next.js-only — the standalone
-    // entry convention (`node server.js`). The newer build-and-pin
-    // path (POST /instances/:id/build-and-pin with target=node_service)
-    // supports arbitrary entry argv for SvelteKit / Nuxt / Remix etc.
-    let entry = vec!["node".to_string(), "server.js".to_string()];
+    // Resolve entry argv. When the gateway uploads a generic Node
+    // bundle (SvelteKit, Nuxt, Remix, custom Express server, etc.) it
+    // sends entry as a URL-encoded JSON string array. Default to the
+    // Next.js standalone convention when absent so existing callers
+    // keep working unchanged.
+    let entry: Vec<String> = match q.entry.as_deref() {
+        Some(s) => match serde_json::from_str::<Vec<String>>(s) {
+            Ok(v) if !v.is_empty() && v.iter().all(|x| !x.is_empty()) => v,
+            _ => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "bad_entry",
+                        "message":
+                            "?entry must be URL-encoded JSON of a non-empty string array, e.g. [\"node\",\"build/index.js\"]",
+                    })),
+                )
+                    .into_response());
+            }
+        },
+        None => vec!["node".to_string(), "server.js".to_string()],
+    };
+    // Reject shell metas in argv — same defence the build-and-pin path
+    // applies. Docker takes argv raw (no shell layer), so these
+    // characters would land as literal filename chars and fail
+    // confusingly; bailing early gives a clearer error.
+    for a in &entry {
+        if a.contains(';')
+            || a.contains('|')
+            || a.contains('&')
+            || a.contains('`')
+            || a.contains('\n')
+        {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "bad_entry",
+                    "message": format!(
+                        "entry arg '{}' contains a shell metacharacter; argv is passed straight to docker (no shell).",
+                        a
+                    ),
+                })),
+            )
+                .into_response());
+        }
+    }
+
     match svc.deploy(&id, &q.wallet, &body_bytes, entry).await {
         Ok(r) => Ok((
             StatusCode::CREATED,
