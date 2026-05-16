@@ -202,14 +202,51 @@ impl NextjsService {
         // NEXT_PUBLIC_SUPABASE_URL must already be baked at BUILD time by
         // the gateway's kraph_github_build_frontend tool — runtime env
         // vars don't affect client-bundled values.
-        let env = vec![
+        //
+        // Service-role key is INTENTIONALLY NOT auto-injected here. A
+        // hostile npm dependency in the agent's Next.js repo can read
+        // any process.env key from any SSR handler, so handing
+        // service_role to every sidecar by default would silently break
+        // RLS for the agent's own data. The static IPFS-pin path has
+        // never exposed service_role (the SPA only ever sees anon), and
+        // the SSR path now matches: agents that genuinely need RLS
+        // bypass on the server (server actions writing trusted data)
+        // must opt in by calling kraph_set_env({ SUPABASE_SERVICE_ROLE_KEY:
+        // ... }) — same path used for any third-party secret. The
+        // user-supplied entries get merged below so an explicit
+        // SUPABASE_SERVICE_ROLE_KEY in instance_env still flows through.
+        let mut env = vec![
             format!("PORT={CONTAINER_PORT}"),
             "HOSTNAME=0.0.0.0".to_string(),
             "NODE_ENV=production".to_string(),
             format!("SUPABASE_URL=http://kong:8000"),
             format!("SUPABASE_ANON_KEY={}", instance.anon_key),
-            format!("SUPABASE_SERVICE_ROLE_KEY={}", instance.service_role_key),
         ];
+        // Merge user-managed env (kraph_set_env). list_env returns
+        // plaintext per the instance DEK; values flow only inside the
+        // node process and into the container env — never to the wire.
+        // User entries can override the defaults above (e.g. NODE_ENV)
+        // because they appear later; PORT/HOSTNAME left first by
+        // convention but the agent overriding them is their prerogative.
+        match self.db.list_env(instance_id) {
+            Ok(user_env) => {
+                for (k, v) in user_env {
+                    // Drop empty keys defensively; everything else passes
+                    // through verbatim.
+                    if !k.is_empty() {
+                        env.push(format!("{}={}", k, v));
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    instance_id,
+                    error = %e,
+                    "failed to load instance_env for nextjs sidecar; \
+                     continuing with built-in env only"
+                );
+            }
+        }
 
         // Host port → container 3000.
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
