@@ -136,6 +136,15 @@ async fn main() -> anyhow::Result<()> {
             post(deploy_nextjs_service_handler)
                 .layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
         )
+        // Read the per-instance Next.js sidecar's container logs. Cheap
+        // diagnostic endpoint — returns interleaved stdout+stderr from
+        // the running (or last-stopped) sidecar container so users can
+        // see why their app crashed on boot, what env vars it logged
+        // they were missing, etc.
+        .route(
+            "/instances/:id/services/nextjs/logs",
+            get(get_nextjs_service_logs_handler),
+        )
         // Append URLs to GOTRUE_URI_ALLOW_LIST + restart the auth container.
         // Used by kraph_auth_set_redirect_urls so the magic-link allow list
         // can grow after the IPFS CID is known (or after kraph_buy_domain).
@@ -408,6 +417,14 @@ struct InstanceQuery {
 struct DeployServiceQuery {
     wallet: String,
     entry: Option<String>,
+}
+
+/// Query for the nextjs/node-service logs endpoint.
+#[derive(Deserialize)]
+struct NextjsLogsQuery {
+    wallet: String,
+    /// Max bytes of log output to return. Clamped to [1024, 262144].
+    tail: Option<usize>,
 }
 
 async fn get_instance_handler(
@@ -1574,6 +1591,107 @@ fn resolve_source_url(
             "must pass either sourceUrl (plaintext) or sourceUrlEnv (env var name on the instance)"
         )),
     }
+}
+
+/// Return the last N bytes of stdout+stderr from the per-instance Next.js
+/// sidecar container. Read-only diagnostic — answers "why did my app
+/// crash on boot?" Returns 404 with `error: "no_sidecar"` when the
+/// instance has no sidecar container (instance is IPFS-pinned or was
+/// never deployed as a node service).
+///
+/// Query params:
+///   wallet=<pubkey>   (required; wallet ownership check)
+///   tail=<int>        (optional; max bytes of log output, default 64K,
+///                      hard cap 256K)
+async fn get_nextjs_service_logs_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<NextjsLogsQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    use bollard::container::LogsOptions;
+    use bollard::container::LogOutput;
+    use futures_util::StreamExt;
+
+    // Wallet ownership — same gate as every other instance-scoped read.
+    if state.manager.get_instance(&id, &q.wallet)?.is_none() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "instance not found or not owned by this wallet",
+            })),
+        )
+            .into_response());
+    }
+
+    let cap_bytes = q
+        .tail
+        .map(|t| t.clamp(1024, 256 * 1024))
+        .unwrap_or(64 * 1024) as usize;
+    let container_name = nextjs_service::container_name_for(&id);
+
+    let docker = bollard::Docker::connect_with_local_defaults()
+        .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?;
+
+    // Probe the container; absence is a clean 404, not a 5xx.
+    let inspect = docker.inspect_container(&container_name, None).await;
+    match inspect {
+        Ok(_) => {}
+        Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "no_sidecar",
+                    "message": format!(
+                        "No Next.js sidecar container for instance {id}. Either the instance was IPFS-pinned (kraph_pin_frontend / kraph_github_build_frontend target=ipfs_pin), or no deploy has run yet."
+                    ),
+                })),
+            )
+                .into_response());
+        }
+        Err(e) => return Err(AppError(anyhow::anyhow!("inspect failed: {e}"))),
+    }
+
+    let opts = LogsOptions::<String> {
+        follow: false,
+        stdout: true,
+        stderr: true,
+        // The tail option is a count, not bytes — we ask for "all" and
+        // truncate by bytes ourselves below. That way we get the most
+        // recent N bytes regardless of how chatty individual lines are.
+        tail: "all".to_string(),
+        timestamps: true,
+        ..Default::default()
+    };
+    let mut stream = docker.logs(&container_name, Some(opts));
+    let mut buf: Vec<u8> = Vec::with_capacity(cap_bytes);
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(LogOutput::StdOut { message })
+            | Ok(LogOutput::StdErr { message })
+            | Ok(LogOutput::Console { message })
+            | Ok(LogOutput::StdIn { message }) => {
+                buf.extend_from_slice(&message);
+                // Trim from the front when we exceed the cap so the tail
+                // is always the most recent bytes.
+                if buf.len() > cap_bytes {
+                    let drop = buf.len() - cap_bytes;
+                    buf.drain(0..drop);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "instance_id": id,
+            "container": container_name,
+            "bytes": buf.len(),
+            "logs": text,
+        })),
+    )
+        .into_response())
 }
 
 async fn migrate_probe_handler(
