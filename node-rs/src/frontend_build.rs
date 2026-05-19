@@ -249,7 +249,13 @@ echo '[kraph-build] done'
 
     let host_config = HostConfig {
         binds: Some(vec![format!("{}:/work:rw", host_workdir)]),
-        memory: Some(2 * 1024 * 1024 * 1024), // 2 GB
+        // 4 GB. Next.js + Supabase deps push past 2 GB during webpack
+        // optimisation on a fresh install (no node_modules cache to
+        // share — every build is from-scratch). 2 GB ran into OOM-kill
+        // mid-build with bollard surfacing only "wait_container error"
+        // because the OOM-killer race deletes the exit row before
+        // wait_container can read it.
+        memory: Some(4 * 1024 * 1024 * 1024),
         cpu_quota: Some(200_000),
         cpu_period: Some(100_000),
         // We remove the container ourselves on the unhappy path; auto_remove
