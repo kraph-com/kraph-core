@@ -6,6 +6,7 @@ mod health;
 mod instance_manager;
 mod integrity;
 mod job_admission;
+mod nextjs_service;
 mod path_safety;
 mod replication;
 mod sigauth;
@@ -125,6 +126,25 @@ async fn main() -> anyhow::Result<()> {
         // Body is small (just URLs + commands), the heavy work happens inside
         // an ephemeral container against a tarball downloaded from GitHub.
         .route("/instances/:id/build-and-pin", post(build_and_pin_handler))
+        // Per-instance Next.js service deploy. Body is a tar.gz of the
+        // Next.js standalone build output; the handler extracts, runs
+        // node:20-alpine as a sidecar on the instance's docker network,
+        // exposes the service at base_port+9. 512 MB body limit matches
+        // MAX_BUNDLE_BYTES in nextjs_service.rs.
+        .route(
+            "/instances/:id/services/nextjs/deploy",
+            post(deploy_nextjs_service_handler)
+                .layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        // Read the per-instance Next.js sidecar's container logs. Cheap
+        // diagnostic endpoint — returns interleaved stdout+stderr from
+        // the running (or last-stopped) sidecar container so users can
+        // see why their app crashed on boot, what env vars it logged
+        // they were missing, etc.
+        .route(
+            "/instances/:id/services/nextjs/logs",
+            get(get_nextjs_service_logs_handler),
+        )
         // Append URLs to GOTRUE_URI_ALLOW_LIST + restart the auth container.
         // Used by kraph_auth_set_redirect_urls so the magic-link allow list
         // can grow after the IPFS CID is known (or after kraph_buy_domain).
@@ -386,6 +406,25 @@ async fn list_instances_handler(
 #[derive(Deserialize)]
 struct InstanceQuery {
     wallet: String,
+}
+
+/// Query for the direct nextjs/node-service deploy endpoint. `entry` is
+/// an optional JSON-encoded string array (URL-encoded) that overrides
+/// the default `["node", "server.js"]` start argv — used by the gateway
+/// when the agent uploads a generic Node bundle (SvelteKit, Nuxt, Remix,
+/// etc.) instead of a Next.js standalone build.
+#[derive(Deserialize)]
+struct DeployServiceQuery {
+    wallet: String,
+    entry: Option<String>,
+}
+
+/// Query for the nextjs/node-service logs endpoint.
+#[derive(Deserialize)]
+struct NextjsLogsQuery {
+    wallet: String,
+    /// Max bytes of log output to return. Clamped to [1024, 262144].
+    tail: Option<usize>,
 }
 
 async fn get_instance_handler(
@@ -1228,32 +1267,266 @@ async fn build_and_pin_handler(
             .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?,
     );
 
-    match frontend_build::build_and_pin(
+    // Branch on the agent-requested distribution target. The build phase
+    // is identical for all variants — only the post-build step differs.
+    let build_target = match frontend_build::BuildTarget::from_request(&req) {
+        Ok(t) => t,
+        Err(e) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_target",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response());
+        }
+    };
+    match build_target {
+        frontend_build::BuildTarget::IpfsPin => {
+            match frontend_build::build_and_pin(
+                docker,
+                &state.config.kubo_api_url,
+                &state.config.public_host,
+                state.config.api_port,
+                req,
+            )
+            .await
+            {
+                Ok(r) => Ok((
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({
+                        "cid": r.cid,
+                        "url": r.url,
+                        "size": r.size_bytes,
+                        "fileCount": r.file_count,
+                        "durationMs": r.duration_ms,
+                        "buildLog": r.build_log,
+                        "exitCode": r.exit_code,
+                    })),
+                )
+                    .into_response()),
+                Err(e) => Ok((
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": "build_failed",
+                        "message": e.to_string(),
+                    })),
+                )
+                    .into_response()),
+            }
+        }
+        frontend_build::BuildTarget::NodeService { entry } => {
+            // Build, then pack + hand off to the per-instance sidecar.
+            // Wallet is taken from req (already sigauth'd above), instance
+            // id from the path param. `entry` is the argv used to launch
+            // the server inside the sidecar (Next.js: ["node",
+            // "server.js"]; SvelteKit: ["node", "build/index.js"]; etc).
+            // Reported back as `target` so the gateway knows whether
+            // this was the legacy nextjs_service shape or the generic
+            // node_service shape.
+            let reported_target = match req.target.as_deref() {
+                Some("nextjs_service") => "nextjs_service",
+                _ => "node_service",
+            };
+            let wallet = req.wallet_pubkey.clone();
+            let artifacts = match frontend_build::build_to_artifacts((*docker).clone().into(), &req).await {
+                Ok(a) => a,
+                Err(e) => {
+                    return Ok((
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": "build_failed",
+                            "message": e.to_string(),
+                        })),
+                    )
+                        .into_response());
+                }
+            };
+            let tarball = match frontend_build::tarball_from_dir(&artifacts.output_root) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Ok((
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": "pack_failed",
+                            "message": e.to_string(),
+                        })),
+                    )
+                        .into_response());
+                }
+            };
+            let svc = nextjs_service::NextjsService::new(
+                (*docker).clone(),
+                (*state.db).clone(),
+                state.config.data_dir.clone(),
+                state.config.public_host.clone(),
+            );
+            match svc.deploy(&id, &wallet, &tarball, entry).await {
+                Ok(r) => Ok((
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({
+                        "target": reported_target,
+                        "instance_id": r.instance_id,
+                        "host_port": r.host_port,
+                        "container_id": r.container_id,
+                        "url": r.url,
+                        "size": tarball.len(),
+                        "durationMs": artifacts.duration_ms,
+                        "buildLog": artifacts.build_log,
+                        "exitCode": artifacts.exit_code,
+                    })),
+                )
+                    .into_response()),
+                Err(e) => Ok((
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": "node_service_deploy_failed",
+                        "message": e.to_string(),
+                        "buildLog": artifacts.build_log,
+                    })),
+                )
+                    .into_response()),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Next.js sidecar service handler
+// ---------------------------------------------------------------------------
+
+/// Deploy or replace the Next.js sidecar service for an instance. Body is
+/// the raw tar.gz of the standalone build output (not JSON) — keeps the
+/// transfer small + avoids the base64 50% blow-up. Auth-shape mirrors
+/// build_and_pin: sigauth over the path + body SHA256.
+///
+/// Query params:
+///   wallet=<pubkey>   (required; wallet ownership check)
+async fn deploy_nextjs_service_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<DeployServiceQuery>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    // Sigauth on the full body bytes so a hostile intermediary can't
+    // replay a previous deploy bundle into a different instance.
+    if let Err(e) = sigauth::verify_request_sig(
+        &headers,
+        "POST",
+        &format!("/instances/{id}/services/nextjs/deploy"),
+        &body_bytes,
+        &q.wallet,
+    ) {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response());
+    }
+
+    // Wallet ownership check.
+    if state.manager.get_instance(&id, &q.wallet)?.is_none() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "instance not found or not owned by this wallet",
+            })),
+        )
+            .into_response());
+    }
+
+    // Single deploy at a time per instance — the swap-rename path is
+    // racy if two POSTs land at once.
+    let _admit = match job_admission::try_acquire(
+        job_admission::JobKind::Build,
+        &q.wallet,
+        &id,
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "nextjs_deploy_already_in_progress",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response());
+        }
+    };
+
+    let docker = bollard::Docker::connect_with_local_defaults()
+        .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?;
+    let svc = nextjs_service::NextjsService::new(
         docker,
-        &state.config.kubo_api_url,
-        &state.config.public_host,
-        state.config.api_port,
-        req,
-    )
-    .await
-    {
+        (*state.db).clone(),
+        state.config.data_dir.clone(),
+        state.config.public_host.clone(),
+    );
+    // Resolve entry argv. When the gateway uploads a generic Node
+    // bundle (SvelteKit, Nuxt, Remix, custom Express server, etc.) it
+    // sends entry as a URL-encoded JSON string array. Default to the
+    // Next.js standalone convention when absent so existing callers
+    // keep working unchanged.
+    let entry: Vec<String> = match q.entry.as_deref() {
+        Some(s) => match serde_json::from_str::<Vec<String>>(s) {
+            Ok(v) if !v.is_empty() && v.iter().all(|x| !x.is_empty()) => v,
+            _ => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "bad_entry",
+                        "message":
+                            "?entry must be URL-encoded JSON of a non-empty string array, e.g. [\"node\",\"build/index.js\"]",
+                    })),
+                )
+                    .into_response());
+            }
+        },
+        None => vec!["node".to_string(), "server.js".to_string()],
+    };
+    // Reject shell metas in argv — same defence the build-and-pin path
+    // applies. Docker takes argv raw (no shell layer), so these
+    // characters would land as literal filename chars and fail
+    // confusingly; bailing early gives a clearer error.
+    for a in &entry {
+        if a.contains(';')
+            || a.contains('|')
+            || a.contains('&')
+            || a.contains('`')
+            || a.contains('\n')
+        {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "bad_entry",
+                    "message": format!(
+                        "entry arg '{}' contains a shell metacharacter; argv is passed straight to docker (no shell).",
+                        a
+                    ),
+                })),
+            )
+                .into_response());
+        }
+    }
+
+    match svc.deploy(&id, &q.wallet, &body_bytes, entry).await {
         Ok(r) => Ok((
             StatusCode::CREATED,
             Json(serde_json::json!({
-                "cid": r.cid,
+                "instance_id": r.instance_id,
+                "host_port": r.host_port,
+                "container_id": r.container_id,
                 "url": r.url,
-                "size": r.size_bytes,
-                "fileCount": r.file_count,
-                "durationMs": r.duration_ms,
-                "buildLog": r.build_log,
-                "exitCode": r.exit_code,
             })),
         )
             .into_response()),
         Err(e) => Ok((
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({
-                "error": "build_failed",
+                "error": "node_service_deploy_failed",
                 "message": e.to_string(),
             })),
         )
@@ -1318,6 +1591,107 @@ fn resolve_source_url(
             "must pass either sourceUrl (plaintext) or sourceUrlEnv (env var name on the instance)"
         )),
     }
+}
+
+/// Return the last N bytes of stdout+stderr from the per-instance Next.js
+/// sidecar container. Read-only diagnostic — answers "why did my app
+/// crash on boot?" Returns 404 with `error: "no_sidecar"` when the
+/// instance has no sidecar container (instance is IPFS-pinned or was
+/// never deployed as a node service).
+///
+/// Query params:
+///   wallet=<pubkey>   (required; wallet ownership check)
+///   tail=<int>        (optional; max bytes of log output, default 64K,
+///                      hard cap 256K)
+async fn get_nextjs_service_logs_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<NextjsLogsQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    use bollard::container::LogsOptions;
+    use bollard::container::LogOutput;
+    use futures_util::StreamExt;
+
+    // Wallet ownership — same gate as every other instance-scoped read.
+    if state.manager.get_instance(&id, &q.wallet)?.is_none() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "instance not found or not owned by this wallet",
+            })),
+        )
+            .into_response());
+    }
+
+    let cap_bytes = q
+        .tail
+        .map(|t| t.clamp(1024, 256 * 1024))
+        .unwrap_or(64 * 1024) as usize;
+    let container_name = nextjs_service::container_name_for(&id);
+
+    let docker = bollard::Docker::connect_with_local_defaults()
+        .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?;
+
+    // Probe the container; absence is a clean 404, not a 5xx.
+    let inspect = docker.inspect_container(&container_name, None).await;
+    match inspect {
+        Ok(_) => {}
+        Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "no_sidecar",
+                    "message": format!(
+                        "No Next.js sidecar container for instance {id}. Either the instance was IPFS-pinned (kraph_pin_frontend / kraph_github_build_frontend target=ipfs_pin), or no deploy has run yet."
+                    ),
+                })),
+            )
+                .into_response());
+        }
+        Err(e) => return Err(AppError(anyhow::anyhow!("inspect failed: {e}"))),
+    }
+
+    let opts = LogsOptions::<String> {
+        follow: false,
+        stdout: true,
+        stderr: true,
+        // The tail option is a count, not bytes — we ask for "all" and
+        // truncate by bytes ourselves below. That way we get the most
+        // recent N bytes regardless of how chatty individual lines are.
+        tail: "all".to_string(),
+        timestamps: true,
+        ..Default::default()
+    };
+    let mut stream = docker.logs(&container_name, Some(opts));
+    let mut buf: Vec<u8> = Vec::with_capacity(cap_bytes);
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(LogOutput::StdOut { message })
+            | Ok(LogOutput::StdErr { message })
+            | Ok(LogOutput::Console { message })
+            | Ok(LogOutput::StdIn { message }) => {
+                buf.extend_from_slice(&message);
+                // Trim from the front when we exceed the cap so the tail
+                // is always the most recent bytes.
+                if buf.len() > cap_bytes {
+                    let drop = buf.len() - cap_bytes;
+                    buf.drain(0..drop);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "instance_id": id,
+            "container": container_name,
+            "bytes": buf.len(),
+            "logs": text,
+        })),
+    )
+        .into_response())
 }
 
 async fn migrate_probe_handler(

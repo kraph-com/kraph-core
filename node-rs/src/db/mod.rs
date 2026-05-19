@@ -239,6 +239,21 @@ pub struct Instance {
     /// skips this row. Bumped by the gateway after a successful
     /// `kraph_pin_instance` x402 settlement.
     pub pinned_until: Option<i64>,
+    /// Host-mapped port for the per-instance Next.js sidecar service.
+    /// `None` for instances whose frontend is IPFS-pinned (the default).
+    /// Set by `POST /instances/:id/services/nextjs/deploy`. When set,
+    /// the gateway's subdomain proxy routes `<id>.kraph.com/` and any
+    /// non-/api / non-/studio path to this port instead of falling
+    /// through.
+    #[serde(default)]
+    pub nextjs_service_port: Option<u16>,
+    /// `None` if no service deployed, else one of: `deploying`, `running`, `failed`.
+    #[serde(default)]
+    pub nextjs_service_status: Option<String>,
+    /// Unix epoch seconds of the most recent successful deploy. `None`
+    /// for IPFS-mode instances.
+    #[serde(default)]
+    pub nextjs_service_deployed_at: Option<i64>,
 }
 
 fn default_lifecycle_state() -> String {
@@ -608,6 +623,34 @@ impl Database {
         conn.execute(
             "UPDATE port_allocations SET instance_id = ?1 WHERE base_port = ?2",
             params![instance_id, base_port as u32],
+        )?;
+        Ok(())
+    }
+
+    /// Set or clear the Next.js sidecar service binding for an instance.
+    /// `port=None, status=None` clears (used on teardown). Otherwise both
+    /// must be Some — passing one without the other is a programming
+    /// error and we panic.
+    pub fn set_nextjs_service(
+        &self,
+        instance_id: &str,
+        port: Option<u16>,
+        status: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            r#"UPDATE instances
+                  SET nextjs_service_port = ?2,
+                      nextjs_service_status = ?3,
+                      nextjs_service_deployed_at = ?4
+                WHERE id = ?1"#,
+            params![
+                instance_id,
+                port.map(|p| p as u32),
+                if port.is_some() { Some(status) } else { None },
+                if port.is_some() { Some(now) } else { None },
+            ],
         )?;
         Ok(())
     }
@@ -1215,5 +1258,10 @@ fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<Instance> {
             .unwrap_or_else(default_lifecycle_state),
         last_seen_at: row.get("last_seen_at")?,
         pinned_until: row.get("pinned_until")?,
+        nextjs_service_port: row
+            .get::<_, Option<u32>>("nextjs_service_port")?
+            .map(|p| p as u16),
+        nextjs_service_status: row.get("nextjs_service_status")?,
+        nextjs_service_deployed_at: row.get("nextjs_service_deployed_at")?,
     })
 }
