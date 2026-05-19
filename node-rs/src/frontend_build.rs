@@ -360,6 +360,21 @@ echo '[kraph-build] done'
                     }) if status_code == 404 => {
                         return Ok::<i64, anyhow::Error>(137);
                     }
+                    // bollard fires DockerContainerWaitError for ANY
+                    // non-zero container exit. Its Display impl drops
+                    // the `error` and `code` fields and just prints the
+                    // useless string "Docker container wait error" —
+                    // which is exactly what bit the from-github
+                    // orchestrator's build step before this match arm
+                    // existed. Treat as a successful wait with the
+                    // container's non-zero rc; the caller will pair
+                    // that with the captured log tail to surface the
+                    // actual reason (npm install failed, build script
+                    // errored, etc.). Same pattern as
+                    // db_migration.rs::wait_container.
+                    Err(BollardError::DockerContainerWaitError { code, .. }) => {
+                        return Ok::<i64, anyhow::Error>(code);
+                    }
                     Err(e) => return Err(anyhow!("wait_container: {e}")),
                 }
             }
