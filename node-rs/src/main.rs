@@ -104,6 +104,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/instances", get(list_instances_handler))
         .route("/instances/:id", get(get_instance_handler))
         .route("/instances/:id", delete(destroy_handler))
+        .route(
+            "/instances/:id/credentials",
+            get(get_instance_credentials_handler),
+        )
         .route("/instances/:id/health", get(instance_health_handler))
         .route("/instances/:id/extend", post(extend_handler))
         // Idle-suspend lifecycle. /touch is hit by every proxy hop to
@@ -442,6 +446,43 @@ async fn get_instance_handler(
         None => Ok(Json(
             serde_json::json!({ "error": "not found" }),
         )),
+    }
+}
+
+/// Reveal anon_key / service_role_key / jwt_secret / postgres_password for an
+/// owned instance. Same `?wallet=` gate as get_instance_handler — the wallet
+/// pubkey + instance_id pair is the implicit owner credential everywhere in
+/// node-rs today. Used by the Forge dashboard's Connect panel so a wallet
+/// owner can recover the keys kraph_provision returned at creation time
+/// without re-provisioning the whole stack.
+///
+/// Threat note: this is a "owner-equivalent" disclosure path. Long-term the
+/// audit-2026-05-11 sigauth (mitigation #1) should be required here; today
+/// the same posture as the rest of /instances/:id applies — the wallet is
+/// the secret.
+async fn get_instance_credentials_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<InstanceQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let instance = state
+        .manager
+        .list_instances(&q.wallet, None)?
+        .into_iter()
+        .find(|i| i.id == id);
+    match instance {
+        Some(i) => Ok(Json(serde_json::json!({
+            "id": i.id,
+            "wallet_pubkey": i.wallet_pubkey,
+            "url": i.url,
+            "kong_port": i.kong_port,
+            "postgres_port": i.postgres_port,
+            "anon_key": i.anon_key,
+            "service_role_key": i.service_role_key,
+            "jwt_secret": i.jwt_secret,
+            "postgres_password": i.postgres_password,
+        }))),
+        None => Ok(Json(serde_json::json!({ "error": "not found" }))),
     }
 }
 
