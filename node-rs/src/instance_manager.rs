@@ -437,6 +437,18 @@ impl InstanceManager {
         let final_status = if healthy { "running" } else { "degraded" };
         self.db.update_instance_status(instance_id, final_status)?;
 
+        // Apply the storage-schema GRANTs supabase/storage-api needs but
+        // our template can't bake in at DB init (storage.buckets, .objects,
+        // .migrations are created by storage-api's own boot-time migrations
+        // running as supabase_storage_admin, well after Postgres init
+        // scripts finish — see apply_storage_grants doc for the full
+        // explanation of why this can't live in /docker-entrypoint-initdb.d/).
+        if healthy {
+            if let Err(e) = self.apply_storage_grants(&compose_project).await {
+                warn!(id = %instance_id, error = %e, "apply_storage_grants failed (non-fatal)");
+            }
+        }
+
         info!(id = %instance_id, status = %final_status, "instance finalize complete");
         Ok(())
     }
@@ -528,6 +540,17 @@ impl InstanceManager {
             .wait_for_health(&compose_project, Duration::from_secs(30))
             .await;
         let status = if healthy { "running" } else { "degraded" };
+
+        // Storage schema GRANTs (see finalize_provision's call site for the
+        // long explanation). On the warm path the storage-api container in
+        // the warm stack already ran its migrations, so the tables exist
+        // and grants apply on the first try — but the helper retries
+        // anyway, so this is safe.
+        if healthy {
+            if let Err(e) = self.apply_storage_grants(&compose_project).await {
+                warn!(id = %id, error = %e, "apply_storage_grants failed (non-fatal)");
+            }
+        }
 
         let now = Utc::now().to_rfc3339();
         let url = format!("http://{}:{}", self.config.hostname, kong_port);
@@ -1483,6 +1506,94 @@ CPUSET_CPUS={cpuset}
 
     /// Poll Docker (via bollard) until every container in the compose project
     /// reports `running`, or the timeout elapses.
+    /// GRANT the JWT-mapped roles (anon / authenticated / service_role)
+    /// access to the storage schema. Without this every Supabase Storage
+    /// API call returns 42501 from `aclchk.c` ("permission denied for
+    /// table buckets"), which supabase/storage-api wraps as the
+    /// misleading user-facing message "new row violates row-level
+    /// security policy" — making it look like an RLS problem when it's
+    /// actually a missing-GRANT problem.
+    ///
+    /// Why not in /docker-entrypoint-initdb.d/: storage.buckets/.objects/
+    /// .migrations are created by the storage-api container's boot-time
+    /// migration step (running as supabase_storage_admin), which finishes
+    /// well after Postgres init scripts. Grants must run from outside the
+    /// db container, after storage-api comes up.
+    ///
+    /// Why explicit table list instead of GRANT ALL ON ALL TABLES IN
+    /// SCHEMA storage: on a real instance the latter only landed on
+    /// s3_multipart_uploads + s3_multipart_uploads_parts — buckets,
+    /// objects, migrations were silently skipped. Cause not pinned down
+    /// (suspected race between the catalog snapshot the planner reads
+    /// and storage-api's migration completing), but explicit names work
+    /// reliably.
+    ///
+    /// Retries up to 10×2s because wait_for_health only confirms the
+    /// container is `state=running` — storage-api's migrations may still
+    /// be in flight when this fires.
+    ///
+    /// Idempotent — GRANT is safe to re-run.
+    async fn apply_storage_grants(&self, compose_project: &str) -> Result<()> {
+        let db_container = format!("{compose_project}-db-1");
+        let sql = "\
+            GRANT USAGE ON SCHEMA storage TO anon, authenticated, service_role; \
+            GRANT ALL PRIVILEGES ON TABLE \
+                storage.buckets, storage.objects, storage.migrations, \
+                storage.s3_multipart_uploads, storage.s3_multipart_uploads_parts \
+                TO anon, authenticated, service_role; \
+            GRANT ALL ON ALL SEQUENCES IN SCHEMA storage TO anon, authenticated, service_role; \
+            GRANT ALL ON ALL FUNCTIONS IN SCHEMA storage TO anon, authenticated, service_role; \
+            ALTER DEFAULT PRIVILEGES FOR ROLE supabase_storage_admin IN SCHEMA storage \
+                GRANT ALL ON TABLES TO anon, authenticated, service_role; \
+            ALTER DEFAULT PRIVILEGES FOR ROLE supabase_storage_admin IN SCHEMA storage \
+                GRANT ALL ON SEQUENCES TO anon, authenticated, service_role; \
+            ALTER DEFAULT PRIVILEGES FOR ROLE supabase_storage_admin IN SCHEMA storage \
+                GRANT ALL ON FUNCTIONS TO anon, authenticated, service_role;";
+        for attempt in 1..=10u32 {
+            let output = Command::new("docker")
+                .args([
+                    "exec",
+                    "-u",
+                    "postgres",
+                    &db_container,
+                    "psql",
+                    "-U",
+                    "supabase_admin",
+                    "-d",
+                    "postgres",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-c",
+                    sql,
+                ])
+                .output()
+                .await;
+            match output {
+                Ok(o) if o.status.success() => {
+                    info!(compose_project, attempt, "storage grants applied");
+                    return Ok(());
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    if attempt == 10 {
+                        warn!(compose_project, %stderr, "storage grants failed after 10 attempts");
+                        return Ok(());
+                    }
+                    debug!(compose_project, attempt, %stderr, "storage grants attempt failed, retrying");
+                }
+                Err(e) => {
+                    if attempt == 10 {
+                        warn!(compose_project, error = %e, "storage grants exec failed");
+                        return Ok(());
+                    }
+                    debug!(compose_project, attempt, error = %e, "storage grants exec attempt failed, retrying");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Ok(())
+    }
+
     async fn wait_for_health(&self, compose_project: &str, timeout: Duration) -> bool {
         use bollard::container::ListContainersOptions;
         use std::collections::HashMap;
