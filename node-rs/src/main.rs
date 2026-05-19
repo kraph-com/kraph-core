@@ -1,3 +1,4 @@
+mod build_store;
 mod config;
 mod db;
 mod db_migration;
@@ -53,6 +54,11 @@ struct AppState {
     resume_locks: tokio::sync::Mutex<
         std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>,
     >,
+    /// In-flight + recently-finished build registry. build_and_pin_handler
+    /// returns the build_id immediately and spawns the actual build into
+    /// a tokio task that updates this store on completion. Clients poll
+    /// via GET /instances/:id/builds/:build_id. See build_store.rs.
+    build_store: build_store::BuildStore,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         replication,
         db: db.clone(),
         resume_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        build_store: build_store::BuildStore::new(),
     });
 
     // Background tasks.
@@ -130,6 +137,16 @@ async fn main() -> anyhow::Result<()> {
         // Body is small (just URLs + commands), the heavy work happens inside
         // an ephemeral container against a tarball downloaded from GitHub.
         .route("/instances/:id/build-and-pin", post(build_and_pin_handler))
+        // Poll a previously-spawned build by build_id. Returns current
+        // status (running | succeeded | failed), the last MAX_LOG_BYTES
+        // of build container stdout/stderr, and result fields on
+        // completion (cid+url for ipfs_pin, host_port+url for service
+        // targets). Mirrors build_and_pin_handler's auth: wallet must
+        // own the instance the build is bound to. See build_store.rs.
+        .route(
+            "/instances/:id/builds/:build_id",
+            get(get_build_status_handler),
+        )
         // Per-instance Next.js service deploy. Body is a tar.gz of the
         // Next.js standalone build output; the handler extracts, runs
         // node:20-alpine as a sidecar on the instance's docker network,
@@ -1284,8 +1301,9 @@ async fn build_and_pin_handler(
     };
 
     // Audit F66: cap concurrent builds at 1 per wallet AND 1 per
-    // instance. Drop on error so the slot is freed before we return.
-    let _admit = match job_admission::try_acquire(
+    // instance. The guard is moved into the spawned task below so it
+    // lives for the full build duration, not just the HTTP response.
+    let admit_guard = match job_admission::try_acquire(
         job_admission::JobKind::Build,
         &req.wallet_pubkey,
         &id,
@@ -1303,13 +1321,8 @@ async fn build_and_pin_handler(
         }
     };
 
-    let docker = std::sync::Arc::new(
-        bollard::Docker::connect_with_local_defaults()
-            .map_err(|e| AppError(anyhow::anyhow!("connect docker: {e}")))?,
-    );
-
-    // Branch on the agent-requested distribution target. The build phase
-    // is identical for all variants — only the post-build step differs.
+    // Branch decision is part of validation — fail fast on bad target
+    // before we hand off to a background task.
     let build_target = match frontend_build::BuildTarget::from_request(&req) {
         Ok(t) => t,
         Err(e) => {
@@ -1323,6 +1336,152 @@ async fn build_and_pin_handler(
                 .into_response());
         }
     };
+    let reported_target = match &build_target {
+        frontend_build::BuildTarget::IpfsPin => "ipfs_pin",
+        frontend_build::BuildTarget::NodeService { .. } => match req.target.as_deref() {
+            Some("nextjs_service") => "nextjs_service",
+            _ => "node_service",
+        },
+    };
+
+    // Spawn the actual build into a tokio task and return immediately.
+    // The previous flow blocked the response for 5+ minutes while docker
+    // ran the build; anything between client and node (Cloudflare's 100s
+    // response cap, a gateway restart, a flaky link) cut the response
+    // mid-build and the client saw "stuck" while work continued on the
+    // node. Now: validate → mint build_id → spawn → 202. Clients poll
+    // GET /instances/:id/builds/:build_id for status + log_tail.
+    let build_id = nanoid::nanoid!(16).to_lowercase();
+    state
+        .build_store
+        .start(
+            build_id.clone(),
+            id.clone(),
+            req.wallet_pubkey.clone(),
+            Some(reported_target.to_string()),
+        )
+        .await;
+
+    let task_state = state.clone();
+    let task_id = id.clone();
+    let task_build_id = build_id.clone();
+    let task_target = reported_target.to_string();
+    tokio::spawn(async move {
+        // admit_guard drops when this task exits — that's the only place
+        // the wallet/instance slot is released. Survives the original
+        // HTTP connection being cut, so a CF-killed POST no longer leaks
+        // an admission slot.
+        let _admit = admit_guard;
+        run_build_task(task_state, task_id, task_build_id, task_target, build_target, req).await;
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "buildId": build_id,
+            "status": "running",
+            "target": reported_target,
+        })),
+    )
+        .into_response())
+}
+
+/// GET /instances/:id/builds/:build_id — poll a previously-spawned
+/// build. Returns the BuildStore row as JSON. 404 if the build_id
+/// is unknown OR the row's stored wallet doesn't match the caller.
+///
+/// Auth: caller passes their wallet pubkey via the `wallet` query
+/// parameter (same shape as get_function_source / deploy_function's
+/// GET endpoints). We then verify ownership of the build by comparing
+/// against the wallet stored in the BuildState — set when
+/// build_and_pin_handler validated wallet ownership before spawning
+/// the build. So any caller who passes a wallet that doesn't match
+/// the build's owning wallet gets a 404 (not 403 — same response so
+/// an attacker can't probe whether a build_id exists for another
+/// wallet's instance).
+async fn get_build_status_handler(
+    State(state): State<Arc<AppState>>,
+    Path((id, build_id)): Path<(String, String)>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    let row = match state.build_store.get(&build_id).await {
+        Some(r) => r,
+        None => {
+            return Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "build_id_unknown" })),
+            )
+                .into_response());
+        }
+    };
+    if row.instance_id != id {
+        // Path id mismatch (typo or cross-instance probe). 404 to keep
+        // the response shape indistinguishable from a real unknown id.
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "build_id_unknown" })),
+        )
+            .into_response());
+    }
+    let caller_wallet = q.get("wallet").map(|s| s.as_str()).unwrap_or("");
+    if caller_wallet != row.wallet_pubkey {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "build_id_unknown" })),
+        )
+            .into_response());
+    }
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "buildId": row.build_id,
+            "instanceId": row.instance_id,
+            "status": row.status.as_str(),
+            "target": row.target,
+            "startedAt": row.started_at.to_rfc3339(),
+            "finishedAt": row.finished_at.map(|t| t.to_rfc3339()),
+            "exitCode": row.exit_code,
+            "logTail": row.log_tail,
+            "durationMs": row.duration_ms,
+            "cid": row.cid,
+            "url": row.url,
+            "sizeBytes": row.size_bytes,
+            "fileCount": row.file_count,
+            "hostPort": row.host_port,
+            "containerId": row.container_id,
+            "error": row.error,
+        })),
+    )
+        .into_response())
+}
+
+/// Actual build work, run in a tokio task spawned by build_and_pin_handler.
+/// Owns the AdmissionGuard for the build's lifetime; on return (success
+/// or failure), the guard drops and the wallet/instance slot is freed.
+/// Result fields are written into BuildStore; clients poll for them.
+async fn run_build_task(
+    state: Arc<AppState>,
+    id: String,
+    build_id: String,
+    reported_target: String,
+    build_target: frontend_build::BuildTarget,
+    req: frontend_build::BuildAndPinRequest,
+) {
+    let docker = match bollard::Docker::connect_with_local_defaults() {
+        Ok(d) => std::sync::Arc::new(d),
+        Err(e) => {
+            state
+                .build_store
+                .complete_failure(
+                    &build_id,
+                    format!("connect docker: {e}"),
+                    String::new(),
+                    None,
+                )
+                .await;
+            return;
+        }
+    };
     match build_target {
         frontend_build::BuildTarget::IpfsPin => {
             match frontend_build::build_and_pin(
@@ -1334,67 +1493,56 @@ async fn build_and_pin_handler(
             )
             .await
             {
-                Ok(r) => Ok((
-                    StatusCode::CREATED,
-                    Json(serde_json::json!({
-                        "cid": r.cid,
-                        "url": r.url,
-                        "size": r.size_bytes,
-                        "fileCount": r.file_count,
-                        "durationMs": r.duration_ms,
-                        "buildLog": r.build_log,
-                        "exitCode": r.exit_code,
-                    })),
-                )
-                    .into_response()),
-                Err(e) => Ok((
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": "build_failed",
-                        "message": e.to_string(),
-                    })),
-                )
-                    .into_response()),
+                Ok(r) => {
+                    let exit_code = r.exit_code;
+                    let log_tail = r.build_log.clone();
+                    state
+                        .build_store
+                        .complete_success(&build_id, move |b| {
+                            b.cid = Some(r.cid);
+                            b.url = Some(r.url);
+                            b.size_bytes = Some(r.size_bytes);
+                            b.file_count = Some(r.file_count);
+                            b.duration_ms = Some(r.duration_ms);
+                            b.exit_code = Some(exit_code);
+                            b.log_tail = log_tail;
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    state
+                        .build_store
+                        .complete_failure(&build_id, e.to_string(), String::new(), None)
+                        .await;
+                }
             }
         }
         frontend_build::BuildTarget::NodeService { entry } => {
-            // Build, then pack + hand off to the per-instance sidecar.
-            // Wallet is taken from req (already sigauth'd above), instance
-            // id from the path param. `entry` is the argv used to launch
-            // the server inside the sidecar (Next.js: ["node",
-            // "server.js"]; SvelteKit: ["node", "build/index.js"]; etc).
-            // Reported back as `target` so the gateway knows whether
-            // this was the legacy nextjs_service shape or the generic
-            // node_service shape.
-            let reported_target = match req.target.as_deref() {
-                Some("nextjs_service") => "nextjs_service",
-                _ => "node_service",
-            };
             let wallet = req.wallet_pubkey.clone();
-            let artifacts = match frontend_build::build_to_artifacts((*docker).clone().into(), &req).await {
-                Ok(a) => a,
-                Err(e) => {
-                    return Ok((
-                        StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({
-                            "error": "build_failed",
-                            "message": e.to_string(),
-                        })),
-                    )
-                        .into_response());
-                }
-            };
+            let artifacts =
+                match frontend_build::build_to_artifacts((*docker).clone().into(), &req).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        state
+                            .build_store
+                            .complete_failure(&build_id, e.to_string(), String::new(), None)
+                            .await;
+                        return;
+                    }
+                };
             let tarball = match frontend_build::tarball_from_dir(&artifacts.output_root) {
                 Ok(b) => b,
                 Err(e) => {
-                    return Ok((
-                        StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({
-                            "error": "pack_failed",
-                            "message": e.to_string(),
-                        })),
-                    )
-                        .into_response());
+                    state
+                        .build_store
+                        .complete_failure(
+                            &build_id,
+                            format!("pack_failed: {e}"),
+                            artifacts.build_log.clone(),
+                            Some(artifacts.exit_code),
+                        )
+                        .await;
+                    return;
                 }
             };
             let svc = nextjs_service::NextjsService::new(
@@ -1404,30 +1552,36 @@ async fn build_and_pin_handler(
                 state.config.public_host.clone(),
             );
             match svc.deploy(&id, &wallet, &tarball, entry).await {
-                Ok(r) => Ok((
-                    StatusCode::CREATED,
-                    Json(serde_json::json!({
-                        "target": reported_target,
-                        "instance_id": r.instance_id,
-                        "host_port": r.host_port,
-                        "container_id": r.container_id,
-                        "url": r.url,
-                        "size": tarball.len(),
-                        "durationMs": artifacts.duration_ms,
-                        "buildLog": artifacts.build_log,
-                        "exitCode": artifacts.exit_code,
-                    })),
-                )
-                    .into_response()),
-                Err(e) => Ok((
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": "node_service_deploy_failed",
-                        "message": e.to_string(),
-                        "buildLog": artifacts.build_log,
-                    })),
-                )
-                    .into_response()),
+                Ok(r) => {
+                    let log_tail = artifacts.build_log.clone();
+                    let exit_code = artifacts.exit_code;
+                    let duration_ms = artifacts.duration_ms;
+                    let size = tarball.len() as u64;
+                    state
+                        .build_store
+                        .complete_success(&build_id, move |b| {
+                            b.host_port = Some(r.host_port);
+                            b.container_id = Some(r.container_id);
+                            b.url = Some(r.url);
+                            b.size_bytes = Some(size);
+                            b.duration_ms = Some(duration_ms);
+                            b.exit_code = Some(exit_code);
+                            b.log_tail = log_tail;
+                            b.target = Some(reported_target.clone());
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    state
+                        .build_store
+                        .complete_failure(
+                            &build_id,
+                            format!("node_service_deploy_failed: {e}"),
+                            artifacts.build_log.clone(),
+                            Some(artifacts.exit_code),
+                        )
+                        .await;
+                }
             }
         }
     }
