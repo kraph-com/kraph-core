@@ -440,7 +440,19 @@ echo '[kraph-build] done'
         // because the OOM-killer race deletes the exit row before
         // wait_container can read it.
         memory: Some(4 * 1024 * 1024 * 1024),
-        cpu_quota: Some(200_000),
+        // 3.0 CPUs. The GCP SEV-SNP node has 4 cores total; reserving
+        // one for node-rs + the 7-10 instance docker-compose stacks +
+        // kong + realtime keeps everything else responsive while letting
+        // the build saturate the rest. Next.js 16 + Turbopack + ts-check
+        // are heavily parallel — at 2 CPUs they took 8+ min, blew past
+        // node-rs's 10-min BUILD_TIMEOUT_SECS hard cap, and got killed.
+        // At 3, the same project should finish in ~4-5 min comfortably
+        // under the cap. Job admission (1 build/wallet, 1 build/instance)
+        // makes concurrent multi-tenant builds rare in practice — and on
+        // the rare 2-tenant overlap each shares the 3 cores fairly under
+        // CFS. Bump further (and add a per-host concurrency gate) when
+        // average build duration warrants.
+        cpu_quota: Some(300_000),
         cpu_period: Some(100_000),
         // We remove the container ourselves on the unhappy path; auto_remove
         // can race with logs() and produce 404 reads. Manual cleanup below.
