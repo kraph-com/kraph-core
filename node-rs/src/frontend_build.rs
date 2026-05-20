@@ -385,6 +385,24 @@ unset KRAPH_GITHUB_TOKEN
 unset KRAPH_TARBALL_URL
 echo '[kraph-build] running install…'
 sh -c '{install_cmd}'
+# Disable Next.js's TypeScript checker phase. The build's bundler/swc/
+# turbopack pass still reads tsconfig.compilerOptions (for path aliases
+# like @/components, JSX config, target), but with include=[next-env.d.ts]
+# and exclude=[**/*] the tsc check has zero files to process and returns
+# in ms instead of minutes. Saves 1-3 min on builds where TS checking is
+# the bottleneck after the compile phase (typical for Next.js 16 + Turbopack
+# builds that hit our 10-min hard cap mid-typecheck). Opt out by setting
+# KRAPH_BUILD_KEEP_TYPECHECK=1 on the agent's deploy env_vars — most apps
+# don't need the TS gate on every push (their CI catches it before merge).
+if [ -z "${{KRAPH_BUILD_KEEP_TYPECHECK:-}}" ] && [ -f tsconfig.json ]; then
+  cp tsconfig.json tsconfig.kraph-orig.json
+  if node -e '\''const fs=require("fs");try{{const u=JSON.parse(fs.readFileSync("tsconfig.kraph-orig.json","utf8"));const o=Object.assign({{}},u,{{include:["next-env.d.ts"],exclude:["**/*"]}});fs.writeFileSync("tsconfig.json",JSON.stringify(o,null,2));}}catch(e){{process.exit(1);}}'\'' 2>/dev/null; then
+    echo '[kraph-build] disabled TypeScript check (compilerOptions preserved, files excluded)'
+  else
+    echo '[kraph-build] could not patch tsconfig.json (probably jsonc with comments) — TS check stays on'
+    mv tsconfig.kraph-orig.json tsconfig.json 2>/dev/null || true
+  fi
+fi
 echo '[kraph-build] running build…'
 sh -c '{build_cmd}'
 echo '[kraph-build] copying output…'
