@@ -396,7 +396,7 @@ sh -c '{install_cmd}'
 # don't need the TS gate on every push (their CI catches it before merge).
 if [ -z "${{KRAPH_BUILD_KEEP_TYPECHECK:-}}" ] && [ -f tsconfig.json ]; then
   cp tsconfig.json tsconfig.kraph-orig.json
-  if node -e '\''const fs=require("fs");try{{const u=JSON.parse(fs.readFileSync("tsconfig.kraph-orig.json","utf8"));const o=Object.assign({{}},u,{{include:["next-env.d.ts"],exclude:["**/*"]}});fs.writeFileSync("tsconfig.json",JSON.stringify(o,null,2));}}catch(e){{process.exit(1);}}'\'' 2>/dev/null; then
+  if node -e 'const fs=require("fs");try{{const u=JSON.parse(fs.readFileSync("tsconfig.kraph-orig.json","utf8"));const o=Object.assign({{}},u,{{include:["next-env.d.ts"],exclude:["**/*"]}});fs.writeFileSync("tsconfig.json",JSON.stringify(o,null,2));}}catch(e){{process.exit(1);}}' 2>/dev/null; then
     echo '[kraph-build] disabled TypeScript check (compilerOptions preserved, files excluded)'
   else
     echo '[kraph-build] could not patch tsconfig.json (probably jsonc with comments) — TS check stays on'
