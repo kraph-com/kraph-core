@@ -447,10 +447,40 @@ echo '[kraph-build] done'
         .ok_or_else(|| anyhow!("workdir path not utf8"))?
         .to_string();
 
+    // Persistent npm cache shared across all builds on this host.
+    // npm cache is content-addressable (cacache format) — same package
+    // version at the same integrity hash is the same bytes regardless
+    // of who installed it, and reads do hash verification so a poisoned
+    // entry is detected at lookup time. So no per-tenant isolation
+    // needed; share the cache and reap the speedup. Saves ~3 min on
+    // npm install for any project whose deps were previously fetched
+    // by anyone on the node.
+    //
+    // Host directory is created best-effort just-in-time. If creation
+    // fails (e.g. host filesystem read-only — should never happen on
+    // GCP, but worth not crashing the build over), we skip the mount
+    // and the build runs with the cold default cache, which is still
+    // correct, just slower.
+    let npm_cache_host = std::path::PathBuf::from("/var/lib/kraph/npm-cache");
+    let npm_cache_mount = if tokio::fs::create_dir_all(&npm_cache_host).await.is_ok() {
+        Some(format!("{}:/root/.npm:rw", npm_cache_host.display()))
+    } else {
+        warn!(
+            "could not create {} — falling back to cold npm cache for this build",
+            npm_cache_host.display()
+        );
+        None
+    };
+
     let container_name = format!("kraph-build-{}", nanoid::nanoid!(8).to_lowercase());
 
+    let mut binds = vec![format!("{}:/work:rw", host_workdir)];
+    if let Some(m) = npm_cache_mount {
+        binds.push(m);
+    }
+
     let host_config = HostConfig {
-        binds: Some(vec![format!("{}:/work:rw", host_workdir)]),
+        binds: Some(binds),
         // 4 GB. Next.js + Supabase deps push past 2 GB during webpack
         // optimisation on a fresh install (no node_modules cache to
         // share — every build is from-scratch). 2 GB ran into OOM-kill
