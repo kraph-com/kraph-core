@@ -193,6 +193,33 @@ pub struct BuildArtifacts {
     pub _workdir_guard: tempfile::TempDir,
 }
 
+/// Tap a live build log stream into the BuildStore so pollers see the
+/// container's stdout/stderr incrementally instead of having to wait for
+/// terminal completion. Cloned into the log-spawn task. Empty (no-op)
+/// when the caller has no shared store to update — preserves the legacy
+/// signatures of build_and_pin / build_to_artifacts for any caller that
+/// doesn't have a BuildStore handle.
+#[derive(Clone, Default)]
+pub struct LogSink {
+    pub store: Option<crate::build_store::BuildStore>,
+    pub build_id: Option<String>,
+}
+
+impl LogSink {
+    pub fn new(store: crate::build_store::BuildStore, build_id: String) -> Self {
+        Self {
+            store: Some(store),
+            build_id: Some(build_id),
+        }
+    }
+    async fn push(&self, chunk: &[u8]) {
+        if let (Some(store), Some(id)) = (&self.store, &self.build_id) {
+            let s = String::from_utf8_lossy(chunk);
+            store.append_log(id, s.as_ref()).await;
+        }
+    }
+}
+
 /// Run a frontend build inside a sandboxed container, then pin the output dir
 /// to local Kubo. Caller is responsible for the instance-ownership check.
 pub async fn build_and_pin(
@@ -201,8 +228,9 @@ pub async fn build_and_pin(
     public_host: &str,
     api_port: u16,
     req: BuildAndPinRequest,
+    log_sink: LogSink,
 ) -> Result<BuildAndPinResult> {
-    let artifacts = build_to_artifacts(docker, &req).await?;
+    let artifacts = build_to_artifacts(docker, &req, log_sink).await?;
     let output_root = artifacts.output_root.clone();
 
     // Walk /output, build a multipart form, push to local Kubo.
@@ -269,6 +297,7 @@ pub fn tarball_from_dir(root: &Path) -> Result<Vec<u8>> {
 pub async fn build_to_artifacts(
     docker: Arc<Docker>,
     req: &BuildAndPinRequest,
+    log_sink: LogSink,
 ) -> Result<BuildArtifacts> {
     let started = Instant::now();
 
@@ -456,9 +485,19 @@ echo '[kraph-build] done'
         .context("start container")?;
 
     // Stream logs into a capped buffer, in parallel with the wait future.
+    // Also tap each chunk into the shared BuildStore (via LogSink) so a
+    // GET /instances/:id/builds/:build_id poller sees an incremental
+    // log_tail while the build runs, not just the final tail. The local
+    // buf is still the source of truth for the post-build return value
+    // — `run_build_task` writes that into the BuildState log_tail on
+    // terminal completion, which both deduplicates the live + final
+    // tails (last-writer-wins) and guarantees a complete log even if
+    // BuildStore.append_log dropped some bytes after hitting the
+    // MAX_LOG_BYTES cap mid-build.
     let logs_handle = {
         let docker = docker.clone();
         let cid = container_id.clone();
+        let sink = log_sink.clone();
         tokio::spawn(async move {
             let opts = LogsOptions::<String> {
                 follow: true,
@@ -475,6 +514,9 @@ echo '[kraph-build] done'
                     | Ok(LogOutput::StdErr { message })
                     | Ok(LogOutput::Console { message })
                     | Ok(LogOutput::StdIn { message }) => {
+                        // Tap into BuildStore first so an early `cap-hit
+                        // on local buf` doesn't break the live stream.
+                        sink.push(&message).await;
                         if buf.len() >= MAX_LOG_BYTES {
                             // Already at cap; drop. Continue draining to keep
                             // the daemon from blocking on a full stream.

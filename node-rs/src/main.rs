@@ -1482,6 +1482,15 @@ async fn run_build_task(
             return;
         }
     };
+    // Build-store-backed log sink. Every container stdout/stderr chunk
+    // is appended to BuildState.log_tail in real time so a polling
+    // status fetch sees the same `npm install` / `next build` output
+    // that the build container is producing live. Without this, the
+    // status endpoint returns log_tail="" for the entire 5min build,
+    // the orchestrator's build_log_delta emit gate never fires (its
+    // `tail.length > lastLogLen` condition compares 0>0), and the
+    // dashboard shows a static "running…" with no progress.
+    let log_sink = frontend_build::LogSink::new(state.build_store.clone(), build_id.clone());
     match build_target {
         frontend_build::BuildTarget::IpfsPin => {
             match frontend_build::build_and_pin(
@@ -1490,6 +1499,7 @@ async fn run_build_task(
                 &state.config.public_host,
                 state.config.api_port,
                 req,
+                log_sink,
             )
             .await
             {
@@ -1520,7 +1530,7 @@ async fn run_build_task(
         frontend_build::BuildTarget::NodeService { entry } => {
             let wallet = req.wallet_pubkey.clone();
             let artifacts =
-                match frontend_build::build_to_artifacts((*docker).clone().into(), &req).await {
+                match frontend_build::build_to_artifacts((*docker).clone().into(), &req, log_sink).await {
                     Ok(a) => a,
                     Err(e) => {
                         state

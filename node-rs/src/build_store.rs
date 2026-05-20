@@ -183,6 +183,27 @@ impl BuildStore {
         guard.get(build_id).cloned()
     }
 
+    /// Append a chunk of build container stdout/stderr to a still-running
+    /// build's log_tail. Called by frontend_build's log-stream task on
+    /// every chunk so pollers see incremental output instead of waiting
+    /// for terminal completion. Caps at MAX_LOG_BYTES — once the cap is
+    /// hit, new chunks are dropped (the daemon's stream is still drained
+    /// in frontend_build so docker doesn't block on a full buffer).
+    pub async fn append_log(&self, build_id: &str, chunk: &str) {
+        let mut guard = self.inner.write().await;
+        if let Some(b) = guard.get_mut(build_id) {
+            if b.log_tail.len() >= MAX_LOG_BYTES {
+                return;
+            }
+            let remaining = MAX_LOG_BYTES - b.log_tail.len();
+            if chunk.len() <= remaining {
+                b.log_tail.push_str(chunk);
+            } else {
+                b.log_tail.push_str(&chunk[..remaining]);
+            }
+        }
+    }
+
     /// Total number of tracked builds (running + finished-but-not-GC'd).
     /// Exposed for the /health endpoint.
     pub async fn len(&self) -> usize {
